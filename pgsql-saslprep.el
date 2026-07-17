@@ -346,7 +346,7 @@
     (concat (substring mapped 0 output-position))))
 
 (defun pgsql--saslprep-acceptable-p (text)
-  "Return non-nil when mapped Unicode TEXT passes PostgreSQL checks."
+  "Return non-nil if mapped Unicode TEXT is acceptable to PostgreSQL."
   (let ((position 0)
         randal-p
         lcat-p
