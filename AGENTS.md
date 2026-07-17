@@ -18,12 +18,12 @@ The initial supported surface is intentionally focused:
 - startup, clear-text, MD5, and SCRAM-SHA-256 authentication
 - simple and extended query execution
 - parameter binding, including a distinct SQL NULL value
-- structured results, errors, notices, and server parameter updates
+- structured results, errors, notices, in-band notifications, and server parameter updates
 - core scalar and array codecs needed by real callers
 - transaction state from `ReadyForQuery`
 - query timeout and PostgreSQL cancellation
 
-Connection pooling, pipelining, automatic SQL retry or replay, ORM behavior, migrations, replication, logical decoding, COPY streaming, and LISTEN/NOTIFY are out of scope until a concrete caller and tests justify them.
+Connection pooling, pipelining, automatic SQL retry or replay, ORM behavior, migrations, replication, logical decoding, COPY streaming, and idle LISTEN/NOTIFY polling or dispatch are out of scope until a concrete caller and tests justify them.
 
 ## Core Engineering
 
@@ -98,6 +98,12 @@ For protocol execution, authentication, cancellation, TLS, or lifecycle changes,
 
 ```bash
 ./test/run-ci.sh live
+```
+
+For TLS negotiation or certificate-verification changes, also run the self-contained real-TLS suite:
+
+```bash
+./test/run-tls-live-tests.sh
 ```
 
 Before committing, verify that byte-compilation, checkdoc, and package-lint produce zero warnings and that no external private API leaked into the package:

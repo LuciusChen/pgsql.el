@@ -101,6 +101,20 @@
     (should (equal (nth 1 row) ""))
     (should (equal (nth 2 row) "你好"))))
 
+(ert-deftest pgsql-test-row-description-rejects-binary-format ()
+  "A binary RowDescription should fail before any DataRow is read."
+  (let ((payload
+         (concat (pgsql-test--uint16 1)
+                 (pgsql-test--bytes "answer\0")
+                 (pgsql-test--uint32 0)
+                 (pgsql-test--uint16 0)
+                 (pgsql-test--uint32 23)
+                 (pgsql-test--uint16 4)
+                 (pgsql-test--uint32 #xffffffff)
+                 (pgsql-test--uint16 1))))
+    (should-error (pgsql--parse-columns payload)
+                  :type 'pgsql-protocol-error)))
+
 (ert-deftest pgsql-test-public-values-keep-their-representation-opaque ()
   "Public connection and result accessors should remain ordinary functions."
   (pgsql-test--with-connection connection
@@ -186,6 +200,49 @@
       connection (pgsql-test--bytes "application_name\0value\0extra\0"))
      :type 'pgsql-protocol-error)))
 
+(ert-deftest pgsql-test-notification-response-keeps-session-synchronized ()
+  "NotificationResponse should deliver exact fields without ending a request."
+  (pgsql-test--with-connection connection
+    (let* ((notification-payload
+            (concat (pgsql-test--uint32 4242)
+                    (pgsql-test--bytes "jobs\0ready:你好\0")))
+           (idle-notification-payload
+            (concat (pgsql-test--uint32 4343)
+                    (pgsql-test--bytes "alerts\0\0")))
+           (transcript
+            (concat (pgsql-test--message ?C (pgsql-test--bytes "LISTEN\0"))
+                    (pgsql-test--message ?A notification-payload)
+                    (pgsql-test--message ?Z (unibyte-string ?I))
+                    (pgsql-test--message ?A idle-notification-payload)
+                    (pgsql-test--message ?C (pgsql-test--bytes "SELECT 1\0"))
+                    (pgsql-test--message ?Z (unibyte-string ?I))))
+           notifications
+           (pgsql-notification-functions
+            (list (lambda (actual-connection value)
+                    (push (list actual-connection value) notifications)))))
+      (pgsql--receive connection transcript)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'process-send-string) #'ignore))
+        (pgsql-exec connection "LISTEN jobs")
+        (should (equal notifications
+                       (list (list connection
+                                   '(:pid 4242 :channel "jobs"
+                                     :payload "ready:你好")))))
+        (pgsql-exec connection "SELECT 1")
+        (should
+         (equal (nreverse notifications)
+                (list (list connection
+                            '(:pid 4242 :channel "jobs"
+                              :payload "ready:你好"))
+                      (list connection
+                            '(:pid 4343 :channel "alerts" :payload ""))))))
+      (dolist (payload (list (unibyte-string 0 0 0)
+                             (concat notification-payload
+                                     (unibyte-string 0))))
+        (should-error
+         (pgsql--handle-side-message connection ?A payload)
+         :type 'pgsql-protocol-error)))))
+
 (ert-deftest pgsql-test-idle-timeout-restarts-on-frame-progress ()
   "Fragment progress should restart a response idle timeout."
   (pgsql-test--with-connection connection
@@ -230,6 +287,21 @@
     (pgsql--md5-password
      "alice" "secret" (unibyte-string #x12 #x34 #x56 #x78))
     "md51b28a7c92eb5e95d85e9b9093da502a9")))
+
+(ert-deftest pgsql-test-clear-text-authentication-sends-exact-message ()
+  "Clear-text authentication should send one exact PasswordMessage."
+  (pgsql-test--with-connection connection
+    (let (sent)
+      (cl-letf (((symbol-function 'pgsql--send)
+                 (lambda (_actual-connection bytes)
+                   (setq sent bytes))))
+        (should-not
+         (pgsql--authentication-request
+          connection (pgsql-test--uint32 3) "alice" "secret" nil))
+        (should
+         (equal sent
+                (pgsql-test--message
+                 ?p (pgsql-test--bytes "secret\0"))))))))
 
 (ert-deftest pgsql-test-scram-sha256-matches-rfc-7677-vector ()
   "SCRAM-SHA-256 should match the RFC 7677 no-channel-binding exchange."

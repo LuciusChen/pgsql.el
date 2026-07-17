@@ -15,6 +15,7 @@ Targets:
   checkdoc       Run checkdoc on the distributable package file.
   package-lint   Run package-lint on the distributable package file.
   live           Run PostgreSQL live tests using PGSQL_TEST_* variables.
+  tls-live       Run TLS-specific PostgreSQL live tests.
 EOF
 }
 
@@ -68,7 +69,12 @@ run_package_lint() {
 
 run_live() {
   run_emacs -l ert -l pgsql-live-test \
-    --eval '(ert-run-tests-batch-and-exit t)'
+    --eval "(ert-run-tests-batch-and-exit '(and (tag :live) (not (tag :tls-live))))"
+}
+
+run_tls_live() {
+  run_emacs -l ert -l pgsql-live-test \
+    --eval "(ert-run-tests-batch-and-exit '(tag :tls-live))"
 }
 
 run_target() {
@@ -84,6 +90,7 @@ run_target() {
     checkdoc) run_checkdoc ;;
     package-lint) run_package_lint ;;
     live) run_live ;;
+    tls-live) run_tls_live ;;
     -h|--help) usage ;;
     *)
       usage >&2

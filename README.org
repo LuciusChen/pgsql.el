@@ -77,7 +77,9 @@ Recognized built-in type names are sent as Parse OIDs. Unknown, extension, and d
 
 Both query functions consume the complete response through =ReadyForQuery= before returning or signaling. =pgsql-transaction-status= reports =idle=, =in-transaction=, or =failed-transaction= from that server message. A structured =pgsql-server-error= retains fields such as =:sqlstate=, =:detail=, and =:constraint= through =pgsql-error-fields=, and the same connection remains reusable after a synchronized server error.
 
-Results expose =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, and =pgsql-result-affected-rows=. Column metadata is read through =pgsql-column-name=, =pgsql-column-type-oid=, and =pgsql-column-type-name=. Core scalar and array values are decoded from PostgreSQL text format; unknown types remain UTF-8 strings with their OID preserved in the column metadata. Arbitrary-precision =numeric= and wall-clock =date=/=timestamp= values remain exact text, while =timestamptz= becomes an Emacs time value. =bytea= parameters and results use unibyte strings and accept either PostgreSQL hex or escape output.
+=NotificationResponse= messages encountered while reading a response are delivered through =pgsql-notification-functions= with the connection and a plist containing =:pid=, =:channel=, and =:payload=. The synchronous client does not poll or dispatch messages while a connection is idle.
+
+Results expose =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, and =pgsql-result-affected-rows=. Column metadata is read through =pgsql-column-name=, =pgsql-column-type-oid=, and =pgsql-column-type-name=. Core scalar and array values are decoded from PostgreSQL text format; binary result columns are rejected explicitly rather than guessed. Unknown types remain UTF-8 strings with their OID preserved in the column metadata. Arbitrary-precision =numeric= and wall-clock =date=/=timestamp= values remain exact text, while =timestamptz= becomes an Emacs time value. =bytea= parameters and results use unibyte strings and accept either PostgreSQL hex or escape output.
 
 =pgsql-cancel= sends PostgreSQL's CancelRequest over a separate short-lived connection. The original query path still consumes the cancellation error and its final =ReadyForQuery= before it becomes reusable. A keyboard quit during =pgsql-exec= or =pgsql-exec-params= performs this cancellation and drain internally before re-signaling =quit=; if synchronization fails, the connection is closed instead of being returned in an unknown state.
 
@@ -92,7 +94,7 @@ Connections and results are opaque values. Callers use the public symbols below 
 - Results: =pgsql-result-p=, =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, and =pgsql-result-affected-rows=.
 - Column and type metadata: =pgsql-column-name=, =pgsql-column-type-oid=, =pgsql-column-type-name=, and =pgsql-type-name=.
 - Values and SQL quoting: =pgsql-null= and =pgsql-null-p= distinguish SQL NULL; =pgsql-array-literal= encodes typed arrays; =pgsql-escape-identifier= and =pgsql-escape-literal= quote SQL identifiers and string literals.
-- Diagnostics: =pgsql-error= is the root condition for =pgsql-connection-error=, =pgsql-timeout=, =pgsql-protocol-error=, =pgsql-authentication-error=, and =pgsql-server-error=. =pgsql-error-fields= returns structured server fields, and each function in =pgsql-notice-functions= is called with a connection and a notice plist.
+- Diagnostics and asynchronous server messages: =pgsql-error= is the root condition for =pgsql-connection-error=, =pgsql-timeout=, =pgsql-protocol-error=, =pgsql-authentication-error=, and =pgsql-server-error=. =pgsql-error-fields= returns structured server fields, and functions in =pgsql-notice-functions= and =pgsql-notification-functions= receive a connection plus the corresponding structured plist.
 
 * Development
 
@@ -114,6 +116,12 @@ PGSQL_TEST_DATABASE=pgsql_test \
 #+end_src
 
 The live suite uses the named test database and creates then drops one uniquely named login role to verify non-ASCII SCRAM authentication, so its configured user needs =CREATEROLE=. It never drops or alters a pre-existing role. Unit tests do not require a running PostgreSQL server.
+
+Run the self-contained TLS suite when changing SSL negotiation or certificate verification. It starts one temporary PostgreSQL 16 container with an ephemeral CA and removes all generated state on exit:
+
+#+begin_src sh
+./test/run-tls-live-tests.sh
+#+end_src
 
 * License
 

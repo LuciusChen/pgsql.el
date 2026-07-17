@@ -83,6 +83,9 @@ Zero means no timeout."
 (defvar pgsql-notice-functions nil
   "Functions called with a connection and a PostgreSQL notice plist.")
 
+(defvar pgsql-notification-functions nil
+  "Functions called with a connection and a notification plist.")
+
 (defconst pgsql-null (make-symbol "pgsql-null")
   "Unique value representing SQL NULL in parameters and results.")
 
@@ -589,6 +592,24 @@ Return non-nil when the message was handled."
      t)
     (?S
      (pgsql--parse-parameter-status connection payload)
+     t)
+    (?A
+     (when (< (length payload) 4)
+       (signal 'pgsql-protocol-error
+               (list "Invalid PostgreSQL NotificationResponse message")))
+     (let ((process-id (pgsql--read-uint32 payload 0)))
+       (pcase-let* ((`(,channel . ,payload-offset)
+                     (pgsql--cstring-at payload 4))
+                    (`(,notification . ,end)
+                     (pgsql--cstring-at payload payload-offset)))
+         (unless (= end (length payload))
+           (signal 'pgsql-protocol-error
+                   (list "Invalid PostgreSQL NotificationResponse message")))
+         (run-hook-with-args 'pgsql-notification-functions
+                             connection
+                             (list :pid process-id
+                                   :channel channel
+                                   :payload notification))))
      t)
     (_ nil)))
 
@@ -1211,14 +1232,18 @@ Return zero for nil or non-built-in TYPE so PostgreSQL may infer it."
         (when (> (+ offset 18) (length payload))
           (signal 'pgsql-protocol-error
                   (list "Truncated PostgreSQL RowDescription")))
-        (push (list :name name
-                    :table-oid (pgsql--read-uint32 payload offset)
-                    :attribute-number (pgsql--read-int16 payload (+ offset 4))
-                    :type-oid (pgsql--read-uint32 payload (+ offset 6))
-                    :type-size (pgsql--read-int16 payload (+ offset 10))
-                    :type-modifier (pgsql--read-int32 payload (+ offset 12))
-                    :format (pgsql--read-uint16 payload (+ offset 16)))
-              columns)
+        (let ((format (pgsql--read-uint16 payload (+ offset 16))))
+          (unless (zerop format)
+            (signal 'pgsql-protocol-error
+                    (list "PostgreSQL binary result columns are not supported")))
+          (push (list :name name
+                      :table-oid (pgsql--read-uint32 payload offset)
+                      :attribute-number (pgsql--read-int16 payload (+ offset 4))
+                      :type-oid (pgsql--read-uint32 payload (+ offset 6))
+                      :type-size (pgsql--read-int16 payload (+ offset 10))
+                      :type-modifier (pgsql--read-int32 payload (+ offset 12))
+                      :format format)
+                columns))
         (cl-incf offset 18)))
     (unless (= offset (length payload))
       (signal 'pgsql-protocol-error

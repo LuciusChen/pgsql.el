@@ -62,3 +62,5 @@ jobs:
           PGSQL_TEST_PASSWORD: pgsql
           PGSQL_TEST_DATABASE: pgsql_test
         run: ./test/run-ci.sh live
+      - name: Run PostgreSQL TLS live suite
+        run: ./test/run-tls-live-tests.sh

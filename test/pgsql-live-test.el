@@ -12,6 +12,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'gnutls)
 (require 'pgsql)
 (require 'timer)
 
@@ -53,6 +54,25 @@ Skip the current test when required live-test configuration is absent."
      (unwind-protect
          (progn ,@body)
        (pgsql-disconnect ,connection))))
+
+(defun pgsql-live-test--tls-settings ()
+  "Return the CA, valid host, and invalid host for TLS live tests."
+  (let ((ca (getenv "PGSQL_TEST_TLS_CA"))
+        (host (getenv "PGSQL_TEST_TLS_HOST"))
+        (wrong-host (getenv "PGSQL_TEST_TLS_WRONG_HOST")))
+    (unless (and ca host wrong-host)
+      (ert-skip
+       "Set PGSQL_TEST_TLS_CA, TLS_HOST, and TLS_WRONG_HOST for TLS tests"))
+    (unless (file-readable-p ca)
+      (ert-fail "PGSQL_TEST_TLS_CA must name a readable CA certificate"))
+    (list ca host wrong-host)))
+
+(defun pgsql-live-test--tls-configuration (host sslmode)
+  "Return live connection arguments for HOST using SSLMODE."
+  (let ((configuration (pgsql-live-test--configuration)))
+    (setq configuration (plist-put configuration :host host)
+          configuration (plist-put configuration :sslmode sslmode))
+    configuration))
 
 (defun pgsql-live-test--single-row (result)
   "Return RESULT's sole row, failing when its shape is different."
@@ -123,6 +143,57 @@ Skip the current test when required live-test configuration is absent."
                          '((1))))
           (should (pgsql-live-p connection)))
       (pgsql-disconnect connection))))
+
+(ert-deftest pgsql-live-test-tls-require-negotiates-encryption ()
+  :tags '(:live :tls-live)
+  "SSL mode require should connect to a real TLS-enabled server."
+  (pcase-let ((`(,_ca ,host ,_wrong-host)
+               (pgsql-live-test--tls-settings)))
+    (let ((connection
+           (apply #'pgsql-connect
+                  (pgsql-live-test--tls-configuration host 'require))))
+      (unwind-protect
+          (should (equal (pgsql-result-rows
+                          (pgsql-exec
+                           connection
+                           "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()"))
+                         '((t))))
+        (pgsql-disconnect connection)))))
+
+(ert-deftest pgsql-live-test-tls-verify-full-accepts-valid-hostname ()
+  :tags '(:live :tls-live)
+  "SSL mode verify-full should accept a trusted matching hostname."
+  (pcase-let ((`(,ca ,host ,_wrong-host)
+               (pgsql-live-test--tls-settings)))
+    (let* ((gnutls-trustfiles (list ca))
+           (connection
+            (apply #'pgsql-connect
+                   (pgsql-live-test--tls-configuration
+                    host 'verify-full))))
+      (unwind-protect
+          (should (equal (pgsql-result-rows
+                          (pgsql-exec connection "SELECT 2::int4"))
+                         '((2))))
+        (pgsql-disconnect connection)))))
+
+(ert-deftest pgsql-live-test-tls-verify-full-rejects-wrong-hostname ()
+  :tags '(:live :tls-live)
+  "SSL mode verify-full should reject a trusted certificate for another host."
+  (pcase-let ((`(,ca ,_host ,wrong-host)
+               (pgsql-live-test--tls-settings)))
+    (let ((probe
+           (apply #'pgsql-connect
+                  (pgsql-live-test--tls-configuration
+                   wrong-host 'require))))
+      (unwind-protect
+          (should (pgsql-live-p probe))
+        (pgsql-disconnect probe)))
+    (let ((gnutls-trustfiles (list ca)))
+      (should-error
+       (apply #'pgsql-connect
+              (pgsql-live-test--tls-configuration
+               wrong-host 'verify-full))
+       :type 'pgsql-connection-error))))
 
 (ert-deftest pgsql-live-test-simple-query-and-unicode ()
   :tags '(:live)
