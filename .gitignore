@@ -1,0 +1,5 @@
+*.elc
+*.eln
+.DS_Store
+/.eln-cache/
+/coverage/

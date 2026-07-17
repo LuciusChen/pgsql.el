@@ -1,0 +1,107 @@
+#+title: pgsql.el
+
+=pgsql.el= is a native PostgreSQL wire-protocol client written in Emacs Lisp. It is intended to provide a small, public protocol API without an external =psql= process, JDBC bridge, or user-interface dependency.
+
+* Status
+
+The package is under initial development. The first protocol slice is implemented and tested, but its public API remains unstable until the first release is published.
+
+* Goals
+
+The initial release is focused on the protocol surface needed by database clients:
+
+- TCP and PostgreSQL SSL negotiation
+- clear-text, MD5, and SCRAM-SHA-256 authentication
+- simple and parameterized query execution
+- structured result and error data
+- an explicit SQL NULL representation
+- transaction status reported by =ReadyForQuery=
+- timeouts and PostgreSQL query cancellation
+
+The package is protocol-only. Query consoles, result rendering, completion, schema browsers, saved connections, SQL rewriting, connection pooling, and automatic SQL replay belong to applications built on top of it.
+
+* Requirements
+
+- Emacs 29.1 or newer
+- PostgreSQL is required only for the live test suite
+
+The package has no third-party runtime dependency.
+
+* Installation
+
+During initial development, clone the repository and add it to =load-path=:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/pgsql.el")
+(require 'pgsql)
+#+end_src
+
+Package-manager and MELPA installation instructions will be added after the first release.
+
+* Usage
+
+Connect with keyword arguments and always close the connection when its owner is finished:
+
+#+begin_src emacs-lisp
+(setq connection
+      (pgsql-connect :host "127.0.0.1"
+                     :port 5432
+                     :user "app"
+                     :password "secret"
+                     :database "app"
+                     :sslmode 'prefer))
+
+(unwind-protect
+    (pgsql-result-rows
+     (pgsql-exec connection "SELECT current_database()"))
+  (pgsql-disconnect connection))
+#+end_src
+
+=pgsql-connect= supports =disable=, =prefer=, =require=, and =verify-full= SSL modes. =prefer= falls back to plaintext only when the server explicitly rejects the PostgreSQL SSL request; TLS handshake and certificate failures are never hidden.
+
+The connection object is opaque. Use =pgsql-user=, =pgsql-host=, =pgsql-port=, =pgsql-database=, =pgsql-live-p=, =pgsql-busy-p=, =pgsql-transaction-status=, and =pgsql-parameter= instead of depending on transport state. =pgsql-connect-timeout= bounds the complete TCP, TLS, and authentication sequence; =pgsql-read-timeout= is an idle timeout and restarts whenever a fragmented response makes progress.
+
+Use =pgsql-exec-params= for an extended-protocol query. Each parameter is a cons of its value and optional PostgreSQL type name. =pgsql-null= represents SQL NULL, while Lisp =nil= represents PostgreSQL boolean false:
+
+#+begin_src emacs-lisp
+(pgsql-exec-params
+ connection
+ "SELECT $1::int4, $2::text, $3::boolean, $4::int4[]"
+ (list (cons 42 "int4")
+       (cons pgsql-null "text")
+       (cons nil "bool")
+       (cons (vector 1 pgsql-null 3) "int4[]")))
+#+end_src
+
+Recognized built-in type names are sent as Parse OIDs. Unknown, extension, and domain type names remain valid local encoding hints while PostgreSQL infers their type from the SQL context.
+
+Both query functions consume the complete response through =ReadyForQuery= before returning or signaling. =pgsql-transaction-status= reports =idle=, =in-transaction=, or =failed-transaction= from that server message. A structured =pgsql-server-error= retains fields such as =:sqlstate=, =:detail=, and =:constraint= through =pgsql-error-fields=, and the same connection remains reusable after a synchronized server error.
+
+Results expose =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, and =pgsql-result-affected-rows=. Column metadata is read through =pgsql-column-name=, =pgsql-column-type-oid=, and =pgsql-column-type-name=. Core scalar and array values are decoded from PostgreSQL text format; unknown types remain UTF-8 strings with their OID preserved in the column metadata. Arbitrary-precision =numeric= and wall-clock =date=/=timestamp= values remain exact text, while =timestamptz= becomes an Emacs time value. =bytea= parameters and results use unibyte strings and accept either PostgreSQL hex or escape output.
+
+=pgsql-cancel= sends PostgreSQL's CancelRequest over a separate short-lived connection. The original query path still consumes the cancellation error and its final =ReadyForQuery= before it becomes reusable.
+
+* Development
+
+Run the complete non-live gate with:
+
+#+begin_src sh
+./test/run-ci.sh all
+#+end_src
+
+Run the PostgreSQL 16 live suite with a test server and credentials:
+
+#+begin_src sh
+PGSQL_TEST_HOST=127.0.0.1 \
+PGSQL_TEST_PORT=5432 \
+PGSQL_TEST_USER=pgsql \
+PGSQL_TEST_PASSWORD=pgsql \
+PGSQL_TEST_DATABASE=pgsql_test \
+./test/run-ci.sh live
+#+end_src
+
+The live tests use only the named test database. Unit tests do not require a running PostgreSQL server.
+
+* License
+
+pgsql.el is released under the GNU General Public License, version 3 or later.

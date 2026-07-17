@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  elisp:
+    name: Emacs ${{ matrix.emacs-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs-version: ["29.1", "29.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs-version }}
+      - name: Install package-lint
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\"))" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 'package-lint)"
+      - name: Run non-live gates
+        run: ./test/run-ci.sh all
+
+  postgres-live:
+    name: PostgreSQL 16 live
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pgsql
+          POSTGRES_PASSWORD: pgsql
+          POSTGRES_DB: pgsql_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pgsql -d pgsql_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@master
+        with:
+          version: "29.1"
+      - name: Run PostgreSQL live suite
+        env:
+          PGSQL_TEST_HOST: 127.0.0.1
+          PGSQL_TEST_PORT: "5432"
+          PGSQL_TEST_USER: pgsql
+          PGSQL_TEST_PASSWORD: pgsql
+          PGSQL_TEST_DATABASE: pgsql_test
+        run: ./test/run-ci.sh live
