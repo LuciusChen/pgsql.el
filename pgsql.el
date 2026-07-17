@@ -38,6 +38,7 @@
 (require 'gnutls)
 (require 'json)
 (require 'parse-time)
+(require 'pgsql-saslprep)
 (require 'subr-x)
 
 (defgroup pgsql nil
@@ -47,14 +48,17 @@
 (defcustom pgsql-connect-timeout 10
   "Maximum seconds to establish and authenticate a connection.
 Zero means no timeout."
-  :type 'natnum
+  :type 'number
   :group 'pgsql)
 
 (defcustom pgsql-read-timeout 30
   "Maximum idle seconds while waiting for a PostgreSQL response.
 Zero means no timeout."
-  :type 'natnum
+  :type 'number
   :group 'pgsql)
+
+(defconst pgsql--cancel-recovery-timeout 10
+  "Maximum seconds to cancel and resynchronize an interrupted request.")
 
 (defcustom pgsql-sslmode 'prefer
   "Default PostgreSQL transport security mode."
@@ -66,6 +70,10 @@ Zero means no timeout."
   "Application name reported to PostgreSQL during startup."
   :type 'string
   :group 'pgsql)
+
+(defun pgsql--timeout-p (value)
+  "Return non-nil when VALUE is a valid nonnegative timeout in seconds."
+  (and (numberp value) (>= value 0)))
 
 (defcustom pgsql-max-message-bytes (* 128 1024 1024)
   "Largest accepted PostgreSQL message, including its length word."
@@ -92,7 +100,7 @@ Zero means no timeout."
 (cl-defstruct (pgsql-connection
                (:constructor pgsql--make-connection)
                (:conc-name pgsql--connection-)
-               (:predicate pgsql-connection-p)
+               (:predicate pgsql--connection-p)
                (:copier nil))
   "Opaque PostgreSQL connection state."
   process
@@ -117,12 +125,38 @@ Zero means no timeout."
 
 (cl-defstruct (pgsql-result
                (:constructor pgsql--make-result)
+               (:conc-name pgsql--result-)
+               (:predicate pgsql--result-p)
                (:copier nil))
   "Result of a PostgreSQL query."
   columns
   rows
   command-tag
   affected-rows)
+
+(defun pgsql-connection-p (value)
+  "Return non-nil when VALUE is a PostgreSQL connection."
+  (pgsql--connection-p value))
+
+(defun pgsql-result-p (value)
+  "Return non-nil when VALUE is a PostgreSQL result."
+  (pgsql--result-p value))
+
+(defun pgsql-result-columns (result)
+  "Return column metadata from RESULT."
+  (pgsql--result-columns result))
+
+(defun pgsql-result-rows (result)
+  "Return decoded rows from RESULT."
+  (pgsql--result-rows result))
+
+(defun pgsql-result-command-tag (result)
+  "Return PostgreSQL's command tag from RESULT."
+  (pgsql--result-command-tag result))
+
+(defun pgsql-result-affected-rows (result)
+  "Return the affected-row count from RESULT, or nil."
+  (pgsql--result-affected-rows result))
 
 (defconst pgsql--error-field-names
   '((?S . :severity-localized)
@@ -538,12 +572,12 @@ ERROR-VALUE is the value bound by `condition-case'."
 
 (defun pgsql--parse-parameter-status (connection payload)
   "Record one ParameterStatus PAYLOAD on CONNECTION."
-  (pcase (pgsql--cstrings payload)
-    (`(,name ,value)
-     (puthash name value (pgsql--connection-parameters connection)))
-    (_
-     (signal 'pgsql-protocol-error
-             (list "Invalid PostgreSQL ParameterStatus message")))))
+  (pcase-let* ((`(,name . ,value-offset) (pgsql--cstring-at payload 0))
+               (`(,value . ,end) (pgsql--cstring-at payload value-offset)))
+    (unless (= end (length payload))
+      (signal 'pgsql-protocol-error
+              (list "Invalid PostgreSQL ParameterStatus message")))
+    (puthash name value (pgsql--connection-parameters connection))))
 
 (defun pgsql--handle-side-message (connection type payload)
   "Handle an asynchronous TYPE and PAYLOAD for CONNECTION.
@@ -688,8 +722,9 @@ Use PASSWORD to compute the client proof before optional DEADLINE."
                     (signal 'pgsql-authentication-error
                             (list "Invalid PostgreSQL SCRAM salt")))))
            (iterations (string-to-number iterations-text))
+           (prepared-password (pgsql--saslprep password))
            (salted (pgsql--pbkdf2-sha256
-                    password salt iterations deadline))
+                    prepared-password salt iterations deadline))
            (client-key (pgsql--hmac-sha256 salted "Client Key"))
            (stored-key (secure-hash 'sha256 client-key nil nil t))
            (server-key (pgsql--hmac-sha256 salted "Server Key"))
@@ -1231,14 +1266,22 @@ Return zero for nil or non-built-in TYPE so PostgreSQL may infer it."
              (string-match "\\(?:^\\| \\)\\([0-9]+\\)\\'" command-tag))
     (string-to-number (match-string 1 command-tag))))
 
-(defun pgsql--collect-result (connection)
+(defun pgsql--collect-result (connection &optional deadline)
   "Collect one CONNECTION response through ReadyForQuery.
-Return a cons of result and structured server error fields."
+Return a cons of result and structured server error fields.
+Optional absolute DEADLINE bounds the whole recovery exchange."
   (let ((timeout (pgsql--connection-read-timeout connection))
         columns rows
         final-columns final-rows command-tag server-error terminal-seen)
     (cl-loop
-     for message = (pgsql--read-message-idle connection timeout)
+     for message = (progn
+                     (when (and deadline
+                                (zerop (pgsql--remaining-time deadline)))
+                       (signal 'pgsql-timeout
+                               (list "PostgreSQL recovery timed out")))
+                     (if deadline
+                         (pgsql--read-message connection nil deadline)
+                       (pgsql--read-message-idle connection timeout)))
      for type = (car message)
      for payload = (cdr message)
      do
@@ -1311,6 +1354,20 @@ Return a cons of result and structured server error fields."
   (when (buffer-live-p (pgsql--connection-input-buffer connection))
     (kill-buffer (pgsql--connection-input-buffer connection))))
 
+(defun pgsql--cancel-and-drain (connection)
+  "Cancel CONNECTION's active request and drain it through ReadyForQuery.
+Return non-nil only when the connection is synchronized again."
+  (let* ((deadline (+ (float-time) pgsql--cancel-recovery-timeout))
+         (inhibit-quit t)
+         synchronized)
+    (condition-case nil
+        (progn
+          (pgsql--cancel-with-deadline connection deadline)
+          (pgsql--collect-result connection deadline)
+          (setq synchronized t))
+      (error nil))
+    synchronized))
+
 (defun pgsql--request (connection bytes)
   "Send request BYTES on CONNECTION and return its synchronized result."
   (unless (pgsql-live-p connection)
@@ -1318,10 +1375,11 @@ Return a cons of result and structured server error fields."
   (when (pgsql--connection-busy-p connection)
     (signal 'pgsql-connection-error (list "PostgreSQL connection is busy")))
   (setf (pgsql--connection-busy-p connection) t)
-  (let (synchronized response)
+  (let (sent synchronized response)
     (unwind-protect
         (condition-case err
             (progn
+              (setq sent t)
               (pgsql--send connection bytes)
               (setq response (pgsql--collect-result connection)
                     synchronized t)
@@ -1331,6 +1389,9 @@ Return a cons of result and structured server error fields."
           (pgsql-error
            (signal (car err) (cdr err)))
           (quit
+           (when (or (not sent)
+                     (pgsql--cancel-and-drain connection))
+             (setq synchronized t))
            (signal (car err) (cdr err)))
           (error
            (signal 'pgsql-connection-error
@@ -1364,10 +1425,10 @@ APPLICATION-NAME is reported in the startup packet."
     (signal 'wrong-type-argument (list 'stringp host)))
   (unless (and (integerp port) (> port 0) (<= port 65535))
     (signal 'wrong-type-argument (list 'pgsql-port-p port)))
-  (unless (and (integerp connect-timeout) (>= connect-timeout 0))
-    (signal 'wrong-type-argument (list 'natnump connect-timeout)))
-  (unless (and (integerp read-timeout) (>= read-timeout 0))
-    (signal 'wrong-type-argument (list 'natnump read-timeout)))
+  (unless (pgsql--timeout-p connect-timeout)
+    (signal 'wrong-type-argument (list 'pgsql--timeout-p connect-timeout)))
+  (unless (pgsql--timeout-p read-timeout)
+    (signal 'wrong-type-argument (list 'pgsql--timeout-p read-timeout)))
   (unless (stringp application-name)
     (signal 'wrong-type-argument (list 'stringp application-name)))
   (dolist (value (list database user host application-name))
@@ -1438,9 +1499,16 @@ The value is `idle', `in-transaction', or `failed-transaction'."
 (defun pgsql-set-read-timeout (connection seconds)
   "Set CONNECTION's response idle timeout to SECONDS.
 Zero disables the timeout."
-  (unless (and (integerp seconds) (>= seconds 0))
-    (signal 'wrong-type-argument (list 'natnump seconds)))
+  (unless (pgsql--timeout-p seconds)
+    (signal 'wrong-type-argument (list 'pgsql--timeout-p seconds)))
   (setf (pgsql--connection-read-timeout connection) seconds))
+
+(defun pgsql-set-connect-timeout (connection seconds)
+  "Set CONNECTION's auxiliary connection timeout to SECONDS.
+This timeout bounds future cancellation connections.  Zero disables it."
+  (unless (pgsql--timeout-p seconds)
+    (signal 'wrong-type-argument (list 'pgsql--timeout-p seconds)))
+  (setf (pgsql--connection-connect-timeout connection) seconds))
 
 (defun pgsql-parameter (connection name)
   "Return server parameter NAME recorded for CONNECTION."
@@ -1537,9 +1605,8 @@ PostgreSQL boolean false."
               "'")
     (concat "'" (string-replace "'" "''" value) "'")))
 
-(defun pgsql-cancel (connection)
-  "Request cancellation of CONNECTION's active PostgreSQL command.
-The CancelRequest is sent over a separate short-lived TCP connection."
+(defun pgsql--cancel-with-deadline (connection deadline)
+  "Cancel CONNECTION over an auxiliary socket before absolute DEADLINE."
   (unless (and (pgsql-live-p connection)
                (integerp (pgsql--connection-backend-pid connection))
                (integerp (pgsql--connection-secret-key connection)))
@@ -1559,10 +1626,7 @@ The CancelRequest is sent over a separate short-lived TCP connection."
                      :noquery t))
               (set-process-query-on-exit-flag process nil)
               (pgsql--await-process-open
-               process
-               (and (> (pgsql--connection-connect-timeout connection) 0)
-                    (+ (float-time)
-                       (pgsql--connection-connect-timeout connection)))
+               process deadline
                "PostgreSQL cancellation connection")
               (process-send-string
                process
@@ -1582,6 +1646,14 @@ The CancelRequest is sent over a separate short-lived TCP connection."
              (list (format "PostgreSQL cancellation failed: %s"
                            (error-message-string err))))))
   t)
+
+(defun pgsql-cancel (connection)
+  "Request cancellation of CONNECTION's active PostgreSQL command.
+The CancelRequest is sent over a separate short-lived TCP connection."
+  (let ((timeout (pgsql--connection-connect-timeout connection)))
+    (pgsql--cancel-with-deadline
+     connection
+     (and (> timeout 0) (+ (float-time) timeout)))))
 
 (provide 'pgsql)
 ;;; pgsql.el ends here

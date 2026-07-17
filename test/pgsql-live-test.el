@@ -74,6 +74,56 @@ Skip the current test when required live-test configuration is absent."
       (pgsql-result-rows (pgsql-exec connection "SHOW password_encryption"))
       '(("scram-sha-256"))))))
 
+(ert-deftest pgsql-live-test-scram-prepares-non-ascii-passwords ()
+  :tags '(:live)
+  "Authenticate with a password whose SASLprep form differs from its input."
+  (let* ((role (format "pgsql_saslprep_live_%d_%d"
+                       (emacs-pid) (random 1000000000)))
+         (password "space\u00a0password")
+         (configuration (pgsql-live-test--configuration))
+         (admin (apply #'pgsql-connect configuration))
+         connection
+         created-role-p)
+    (unwind-protect
+        (progn
+          (pgsql-exec admin
+                      (format "CREATE ROLE %s LOGIN PASSWORD %s"
+                              (pgsql-escape-identifier role)
+                              (pgsql-escape-literal password)))
+          (setq created-role-p t)
+          (setq configuration (plist-put configuration :user role)
+                configuration (plist-put configuration :password password)
+                connection (apply #'pgsql-connect configuration))
+          (should (equal (pgsql-result-rows
+                          (pgsql-exec connection "SELECT current_user"))
+                         `((,role))))
+          (should (pgsql-live-p connection)))
+      (when connection
+        (pgsql-disconnect connection))
+      (when (and created-role-p (pgsql-live-p admin))
+        (pgsql-exec admin
+                    (format "DROP ROLE %s"
+                            (pgsql-escape-identifier role))))
+      (pgsql-disconnect admin))))
+
+(ert-deftest pgsql-live-test-empty-parameter-status-values-keep-session-live ()
+  :tags '(:live)
+  "Empty startup and runtime ParameterStatus values should be valid."
+  (let ((connection
+         (apply #'pgsql-connect
+                (plist-put (pgsql-live-test--configuration)
+                           :application-name ""))))
+    (unwind-protect
+        (progn
+          (should (equal (pgsql-parameter connection "application_name") ""))
+          (pgsql-exec connection "SET application_name TO ''")
+          (should (equal (pgsql-parameter connection "application_name") ""))
+          (should (equal (pgsql-result-rows
+                          (pgsql-exec connection "SELECT 1::int4"))
+                         '((1))))
+          (should (pgsql-live-p connection)))
+      (pgsql-disconnect connection))))
+
 (ert-deftest pgsql-live-test-simple-query-and-unicode ()
   :tags '(:live)
   "Return typed scalar and Unicode values through the simple-query path."
@@ -220,6 +270,27 @@ Skip the current test when required live-test configuration is absent."
             (should (equal (pgsql-result-rows
                             (pgsql-exec connection "SELECT 9::int4"))
                            '((9))))
+            (should (pgsql-live-p connection)))
+        (when timer
+          (cancel-timer timer))))))
+
+(ert-deftest pgsql-live-test-keyboard-quit-cancels-and-keeps-session-reusable ()
+  :tags '(:live)
+  "A real keyboard quit should drain cancellation before returning control."
+  (pgsql-live-test--with-connection connection
+    (let (caught timer)
+      (unwind-protect
+          (progn
+            (setq timer (run-at-time 0.2 nil #'keyboard-quit))
+            (condition-case nil
+                (pgsql-exec connection "SELECT pg_sleep(5)")
+              (quit (setq caught t)))
+            (should caught)
+            (should-not (pgsql-busy-p connection))
+            (should (eq (pgsql-transaction-status connection) 'idle))
+            (should (equal (pgsql-result-rows
+                            (pgsql-exec connection "SELECT 10::int4"))
+                           '((10))))
             (should (pgsql-live-p connection)))
         (when timer
           (cancel-timer timer))))))

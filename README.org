@@ -57,9 +57,9 @@ Connect with keyword arguments and always close the connection when its owner is
   (pgsql-disconnect connection))
 #+end_src
 
-=pgsql-connect= supports =disable=, =prefer=, =require=, and =verify-full= SSL modes. =prefer= falls back to plaintext only when the server explicitly rejects the PostgreSQL SSL request; TLS handshake and certificate failures are never hidden.
+=pgsql-connect= supports =disable=, =prefer=, =require=, and =verify-full= SSL modes. =prefer= falls back to plaintext only when the server explicitly rejects the PostgreSQL SSL request; TLS handshake and certificate failures are never hidden. SCRAM-SHA-256 passwords use PostgreSQL-compatible SASLprep, including PostgreSQL's raw-password fallback for input that cannot be prepared.
 
-The connection object is opaque. Use =pgsql-user=, =pgsql-host=, =pgsql-port=, =pgsql-database=, =pgsql-live-p=, =pgsql-busy-p=, =pgsql-transaction-status=, and =pgsql-parameter= instead of depending on transport state. =pgsql-connect-timeout= bounds the complete TCP, TLS, and authentication sequence; =pgsql-read-timeout= is an idle timeout and restarts whenever a fragmented response makes progress.
+The connection object is opaque. Use =pgsql-user=, =pgsql-host=, =pgsql-port=, =pgsql-database=, =pgsql-live-p=, =pgsql-busy-p=, =pgsql-transaction-status=, and =pgsql-parameter= instead of depending on transport state. =pgsql-connect-timeout= bounds the complete TCP, TLS, and authentication sequence; =pgsql-read-timeout= is an idle timeout and restarts whenever a fragmented response makes progress. =pgsql-set-connect-timeout= changes the bound used by later auxiliary cancellation connections, while =pgsql-set-read-timeout= changes the response idle timeout.
 
 Use =pgsql-exec-params= for an extended-protocol query. Each parameter is a cons of its value and optional PostgreSQL type name. =pgsql-null= represents SQL NULL, while Lisp =nil= represents PostgreSQL boolean false:
 
@@ -79,7 +79,20 @@ Both query functions consume the complete response through =ReadyForQuery= befor
 
 Results expose =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, and =pgsql-result-affected-rows=. Column metadata is read through =pgsql-column-name=, =pgsql-column-type-oid=, and =pgsql-column-type-name=. Core scalar and array values are decoded from PostgreSQL text format; unknown types remain UTF-8 strings with their OID preserved in the column metadata. Arbitrary-precision =numeric= and wall-clock =date=/=timestamp= values remain exact text, while =timestamptz= becomes an Emacs time value. =bytea= parameters and results use unibyte strings and accept either PostgreSQL hex or escape output.
 
-=pgsql-cancel= sends PostgreSQL's CancelRequest over a separate short-lived connection. The original query path still consumes the cancellation error and its final =ReadyForQuery= before it becomes reusable.
+=pgsql-cancel= sends PostgreSQL's CancelRequest over a separate short-lived connection. The original query path still consumes the cancellation error and its final =ReadyForQuery= before it becomes reusable. A keyboard quit during =pgsql-exec= or =pgsql-exec-params= performs this cancellation and drain internally before re-signaling =quit=; if synchronization fails, the connection is closed instead of being returned in an unknown state.
+
+* Public API
+
+Connections and results are opaque values. Callers use the public symbols below and must not inspect their representation or call =pgsql--= symbols.
+
+- Connection lifecycle: =pgsql-connect=, =pgsql-disconnect=, and =pgsql-connection-p=. =pgsql-connect= accepts =:database=, =:user=, =:password=, =:host=, =:port=, =:sslmode=, =:connect-timeout=, =:read-timeout=, and =:application-name=.
+- Connection defaults and bounds: =pgsql-connect-timeout=, =pgsql-read-timeout=, =pgsql-sslmode=, =pgsql-application-name=, and =pgsql-max-message-bytes=. =pgsql-set-connect-timeout= and =pgsql-set-read-timeout= change the corresponding bounds on an existing connection.
+- Connection state and metadata: =pgsql-live-p=, =pgsql-busy-p=, =pgsql-transaction-status=, =pgsql-parameter=, =pgsql-user=, =pgsql-host=, =pgsql-port=, and =pgsql-database=.
+- Execution and cancellation: =pgsql-exec=, =pgsql-exec-params=, and =pgsql-cancel=.
+- Results: =pgsql-result-p=, =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, and =pgsql-result-affected-rows=.
+- Column and type metadata: =pgsql-column-name=, =pgsql-column-type-oid=, =pgsql-column-type-name=, and =pgsql-type-name=.
+- Values and SQL quoting: =pgsql-null= and =pgsql-null-p= distinguish SQL NULL; =pgsql-array-literal= encodes typed arrays; =pgsql-escape-identifier= and =pgsql-escape-literal= quote SQL identifiers and string literals.
+- Diagnostics: =pgsql-error= is the root condition for =pgsql-connection-error=, =pgsql-timeout=, =pgsql-protocol-error=, =pgsql-authentication-error=, and =pgsql-server-error=. =pgsql-error-fields= returns structured server fields, and each function in =pgsql-notice-functions= is called with a connection and a notice plist.
 
 * Development
 
@@ -100,7 +113,7 @@ PGSQL_TEST_DATABASE=pgsql_test \
 ./test/run-ci.sh live
 #+end_src
 
-The live tests use only the named test database. Unit tests do not require a running PostgreSQL server.
+The live suite uses the named test database and creates then drops one uniquely named login role to verify non-ASCII SCRAM authentication, so its configured user needs =CREATEROLE=. It never drops or alters a pre-existing role. Unit tests do not require a running PostgreSQL server.
 
 * License
 

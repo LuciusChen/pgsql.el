@@ -104,7 +104,7 @@ Before committing, verify that byte-compilation, checkdoc, and package-lint prod
 
 ```bash
 rg -n -P "(?<![A-Za-z0-9-])(clutch|pg|mysql|mongodb|redis)--[A-Za-z0-9-]+" \
-  pgsql.el test/*.el
+  pgsql*.el test/*.el
 ```
 
 The private-API scan must return no matches.

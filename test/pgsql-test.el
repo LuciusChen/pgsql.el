@@ -101,6 +101,29 @@
     (should (equal (nth 1 row) ""))
     (should (equal (nth 2 row) "你好"))))
 
+(ert-deftest pgsql-test-public-values-keep-their-representation-opaque ()
+  "Public connection and result accessors should remain ordinary functions."
+  (pgsql-test--with-connection connection
+    (let ((result (pgsql--make-result
+                   :columns '((:name "answer" :type-oid 23))
+                   :rows '((42))
+                   :command-tag "SELECT 1"
+                   :affected-rows 1)))
+      (should (pgsql-connection-p connection))
+      (should (pgsql-result-p result))
+      (should (equal (pgsql-result-columns result)
+                     '((:name "answer" :type-oid 23))))
+      (should (equal (pgsql-result-rows result) '((42))))
+      (should (equal (pgsql-result-command-tag result) "SELECT 1"))
+      (should (= (pgsql-result-affected-rows result) 1))
+      (dolist (symbol '(pgsql-connection-p
+                        pgsql-result-p
+                        pgsql-result-columns
+                        pgsql-result-rows
+                        pgsql-result-command-tag
+                        pgsql-result-affected-rows))
+        (should-not (get symbol 'compiler-macro))))))
+
 (ert-deftest pgsql-test-array-codec-handles-quoting-nesting-and-null ()
   "Array codecs should preserve syntax-sensitive values and SQL NULL."
   (let ((decoded
@@ -151,6 +174,17 @@
                            payload)))
     (should (equal (pgsql--startup-message "alice" "app" "tests")
                    expected))))
+
+(ert-deftest pgsql-test-parameter-status-preserves-empty-values ()
+  "ParameterStatus should parse its fixed name/value pair exactly."
+  (pgsql-test--with-connection connection
+    (pgsql--parse-parameter-status
+     connection (pgsql-test--bytes "application_name\0\0"))
+    (should (equal (pgsql-parameter connection "application_name") ""))
+    (should-error
+     (pgsql--parse-parameter-status
+      connection (pgsql-test--bytes "application_name\0value\0extra\0"))
+     :type 'pgsql-protocol-error)))
 
 (ert-deftest pgsql-test-idle-timeout-restarts-on-frame-progress ()
   "Fragment progress should restart a response idle timeout."
@@ -224,6 +258,22 @@
       (should-not (pgsql--scram-finish continued server-final))
       (should-error (pgsql--scram-finish continued "v=invalid")
                     :type 'pgsql-authentication-error))))
+
+(ert-deftest pgsql-test-saslprep-matches-postgresql-password-semantics ()
+  "SASLprep should normalize valid UTF-8 and preserve rejected input raw."
+  (should (equal (pgsql--saslprep "plain ASCII") "plain ASCII"))
+  (should (equal (pgsql--saslprep "a\u00a0b") "a b"))
+  (should (equal (pgsql--saslprep "I\u00adX") "IX"))
+  (should (equal (pgsql--saslprep "\u00aa") "a"))
+  (dolist (password (list "\u00ad"
+                          "a\ue000b"
+                          "a\u0221b"
+                          "a\u05d0"
+                          "\u05d0a\u05d1"
+                          "\u00a0\u0221"
+                          (unibyte-string #xc3 #x28)))
+    (should (equal (pgsql--saslprep password) password)))
+  (should (equal (pgsql--saslprep "\u05d0\u05d1") "\u05d0\u05d1")))
 
 (ert-deftest pgsql-test-ready-for-query-status-is-authoritative ()
   "ReadyForQuery should expose all transaction states and reject others."
@@ -519,6 +569,104 @@
   (pgsql-test--with-connection connection
     (should-error (pgsql-exec connection "SELECT 1\0SELECT 2")
                   :type 'pgsql-error)))
+
+(ert-deftest pgsql-test-fractional-timeouts-and-runtime-setters ()
+  "Timeout APIs should accept nonnegative fractional seconds."
+  (let (connection)
+    (unwind-protect
+        (cl-letf (((symbol-function 'pgsql--open-process) #'ignore)
+                  ((symbol-function 'pgsql--negotiate-tls) #'ignore)
+                  ((symbol-function 'pgsql--startup)
+                   (lambda (value _password) value)))
+          (setq connection
+                (pgsql-connect :database "db" :user "user"
+                               :connect-timeout 0.5 :read-timeout 0.25))
+          (should (= (pgsql--connection-connect-timeout connection) 0.5))
+          (should (= (pgsql--connection-read-timeout connection) 0.25))
+          (pgsql-set-connect-timeout connection 0.75)
+          (pgsql-set-read-timeout connection 1.5)
+          (should (= (pgsql--connection-connect-timeout connection) 0.75))
+          (should (= (pgsql--connection-read-timeout connection) 1.5))
+          (should-error (pgsql-set-connect-timeout connection -0.1)
+                        :type 'wrong-type-argument)
+          (should-error (pgsql-set-read-timeout connection nil)
+                        :type 'wrong-type-argument))
+      (when connection
+        (pgsql-disconnect connection)))))
+
+(ert-deftest pgsql-test-quit-cancels-drains-and-keeps-session-reusable ()
+  "A quit should cancel and synchronize before it leaves the request."
+  (pgsql-test--with-connection connection
+    (setf (pgsql--connection-connect-timeout connection) 0
+          (pgsql--connection-read-timeout connection) 300)
+    (let ((pgsql--cancel-recovery-timeout 0.25)
+          (collect-count 0)
+          (cancel-count 0)
+          cancel-deadline
+          recovery-deadline
+          caught)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'process-send-string) #'ignore)
+                ((symbol-function 'pgsql--cancel-with-deadline)
+                 (lambda (actual deadline)
+                   (should (eq actual connection))
+                   (setq cancel-deadline deadline)
+                   (cl-incf cancel-count)
+                   t))
+                ((symbol-function 'pgsql--collect-result)
+                 (lambda (_connection &optional deadline)
+                   (pcase (cl-incf collect-count)
+                     (1
+                      (should-not deadline)
+                      (signal 'quit nil))
+                     (2
+                      (setq recovery-deadline deadline)
+                      (cons (pgsql--make-result) '(:sqlstate "57014")))
+                     (_
+                      (should-not deadline)
+                      (cons (pgsql--make-result :command-tag "SELECT 1")
+                            nil))))))
+        (condition-case nil
+            (pgsql-exec connection "SELECT pg_sleep(5)")
+          (quit (setq caught t)))
+        (should caught)
+        (should (= cancel-count 1))
+        (should cancel-deadline)
+        (should recovery-deadline)
+        (should (= cancel-deadline recovery-deadline))
+        (should (= (pgsql--connection-connect-timeout connection) 0))
+        (should (= (pgsql--connection-read-timeout connection) 300))
+        (should-not (pgsql-busy-p connection))
+        (should-not (pgsql--connection-broken-p connection))
+        (should (buffer-live-p (pgsql--connection-input-buffer connection)))
+        (should (equal (pgsql-result-command-tag
+                        (pgsql-exec connection "SELECT 1"))
+                       "SELECT 1"))))))
+
+(ert-deftest pgsql-test-quit-recovery-failure-closes-the-session ()
+  "A failed bounded quit recovery should close uncertain protocol state."
+  (pgsql-test--with-connection connection
+    (setf (pgsql--connection-connect-timeout connection) 42)
+    (let (caught)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'process-send-string) #'ignore)
+                ((symbol-function 'delete-process) #'ignore)
+                ((symbol-function 'pgsql--cancel-with-deadline)
+                 (lambda (_connection _deadline)
+                   (signal 'pgsql-timeout '("cancel timed out"))))
+                ((symbol-function 'pgsql--collect-result)
+                 (lambda (_connection &optional _deadline)
+                   (signal 'quit nil))))
+        (condition-case nil
+            (pgsql-exec connection "SELECT pg_sleep(5)")
+          (quit (setq caught t))))
+      (should caught)
+      (should (= (pgsql--connection-connect-timeout connection) 42))
+      (should (pgsql--connection-broken-p connection))
+      (should (pgsql--connection-closing-p connection))
+      (should-not (pgsql-busy-p connection))
+      (should-not (buffer-live-p
+                   (pgsql--connection-input-buffer connection))))))
 
 (ert-deftest pgsql-test-connect-wraps-raw-transport-errors ()
   "Generic network errors should cross the public boundary as pgsql errors."

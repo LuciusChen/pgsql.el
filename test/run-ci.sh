@@ -32,9 +32,11 @@ run_byte_compile() {
   (
     cd "$repo"
     run_emacs --eval '(setq byte-compile-error-on-warn t)' \
-      -f batch-byte-compile pgsql.el test/pgsql-test.el test/pgsql-live-test.el
+      -f batch-byte-compile pgsql-saslprep.el pgsql.el \
+      test/pgsql-test.el test/pgsql-live-test.el
   ) || status=$?
-  rm -f "$repo/pgsql.elc" \
+  rm -f "$repo/pgsql-saslprep.elc" \
+    "$repo/pgsql.elc" \
     "$repo/test/pgsql-test.elc" \
     "$repo/test/pgsql-live-test.elc"
   return "$status"
@@ -45,6 +47,7 @@ run_checkdoc() {
     cd "$repo"
     run_emacs \
       --eval "(require 'checkdoc)" \
+      --eval "(checkdoc-file \"pgsql-saslprep.el\")" \
       --eval "(checkdoc-file \"pgsql.el\")" \
       --eval "(dolist (name '(\"*Warnings*\" \"*warn*\")) (when-let* ((buffer (get-buffer name))) (with-current-buffer buffer (goto-char (point-min)) (when (re-search-forward \"^Warning\" nil t) (princ (buffer-string)) (kill-emacs 1)))))"
   )
@@ -56,9 +59,10 @@ run_package_lint() {
     run_emacs \
       --eval "(require 'package)" \
       --eval "(package-initialize)" \
+      --eval "(setq package-lint-main-file \"pgsql.el\")" \
       -l package-lint \
       -f package-lint-batch-and-exit \
-      pgsql.el
+      pgsql-saslprep.el pgsql.el
   )
 }
 
