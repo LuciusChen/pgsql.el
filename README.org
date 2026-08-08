@@ -4,7 +4,7 @@
 
 * Status
 
-The package is under initial development. The first protocol slice is implemented and tested, but its public API remains unstable until the first release is published.
+The focused 0.1 protocol surface is implemented and covered by deterministic transcript tests, PostgreSQL 16 integration tests, and a self-contained real-TLS suite. It is also exercised by [[https://github.com/LuciusChen/clutch/tree/refactor/pgsql][Clutch's pgsql.el integration branch]]. The API remains pre-1.0 and may evolve as additional callers establish concrete requirements.
 
 * Goals
 
@@ -19,6 +19,12 @@ The initial release is focused on the protocol surface needed by database client
 - timeouts and PostgreSQL query cancellation
 
 The package is protocol-only. Query consoles, result rendering, completion, schema browsers, saved connections, SQL rewriting, connection pooling, and automatic SQL replay belong to applications built on top of it.
+
+* Relationship to pg.el
+
+MELPA already provides [[https://github.com/emarsden/pg-el][pg.el]], a mature and broad PostgreSQL client with COPY support, asynchronous idle LISTEN/NOTIFY handling, Unix-domain sockets, extensible type decoding, and a large server-compatibility matrix. =pgsql.el= is not a fork or drop-in replacement and does not try to match that feature breadth; applications that need those capabilities should use pg.el.
+
+=pgsql.el= provides a narrower protocol-library boundary for synchronous application clients: no third-party runtime dependency, opaque connection and result values, one request in flight, completion only after the matching =ReadyForQuery= has been consumed, authoritative public transaction state, a dedicated SQL NULL value distinct from PostgreSQL false, and bounded cancellation that drains the original connection before reuse. Those lifecycle guarantees let callers such as Clutch depend on public protocol state without reaching into transport internals or maintaining caller-side synchronization workarounds.
 
 * Requirements
 

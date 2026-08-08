@@ -6,6 +6,7 @@
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; Maintainer: Lucius Chen <chenyh572@gmail.com>
+;; Assisted-by: OpenAI Codex:gpt-5.5
 ;;
 ;; The Unicode range tables are derived from PostgreSQL's saslprep.c under
 ;; the PostgreSQL License:
