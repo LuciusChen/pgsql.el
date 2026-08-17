@@ -1,5 +1,7 @@
 #+title: pgsql.el
 
+[[https://melpa.org/#/pgsql][file:https://melpa.org/packages/pgsql-badge.svg]]
+
 =pgsql.el= is a native PostgreSQL wire-protocol client written in Emacs Lisp. It is intended to provide a small, public protocol API without an external =psql= process, JDBC bridge, or user-interface dependency.
 
 * Status
