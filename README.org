@@ -4,7 +4,7 @@
 
 * Status
 
-The focused 0.1 protocol surface is implemented and covered by deterministic transcript tests, PostgreSQL 16 integration tests, and a self-contained real-TLS suite. It is also exercised by [[https://github.com/LuciusChen/clutch/tree/refactor/pgsql][Clutch's pgsql.el integration branch]]. The API remains pre-1.0 and may evolve as additional callers establish concrete requirements.
+The focused 0.1 protocol surface is released and covered by deterministic transcript tests, PostgreSQL 16 integration tests, and a self-contained real-TLS suite. It is also exercised by [[https://github.com/LuciusChen/clutch][Clutch's native PostgreSQL adapter]]. The API remains pre-1.0 and may evolve as additional callers establish concrete requirements.
 
 * Goals
 
@@ -35,14 +35,19 @@ The package has no third-party runtime dependency.
 
 * Installation
 
-During initial development, clone the repository and add it to =load-path=:
+=pgsql= is available from [[https://melpa.org/#/pgsql][MELPA]]. After configuring MELPA, install it with =M-x package-install RET pgsql RET=, or declare it with =use-package=:
+
+#+begin_src emacs-lisp
+(use-package pgsql
+  :ensure t)
+#+end_src
+
+For a source checkout, clone the repository and add it to =load-path=:
 
 #+begin_src emacs-lisp
 (add-to-list 'load-path "/path/to/pgsql.el")
 (require 'pgsql)
 #+end_src
-
-Package-manager and MELPA installation instructions will be added after the first release.
 
 * Usage
 
