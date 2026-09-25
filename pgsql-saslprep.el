@@ -40,6 +40,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'ucs-normalize)
 
 (defconst pgsql--saslprep-non-ascii-space-ranges
@@ -301,50 +302,34 @@
 
 (defun pgsql--saslprep-ascii-p (string)
   "Return non-nil when every character in STRING is ASCII."
-  (let ((position 0)
-        (ascii-p t))
-    (while (and ascii-p (< position (length string)))
-      (when (> (aref string position) #x7F)
-        (setq ascii-p nil))
-      (setq position (1+ position)))
-    ascii-p))
+  (cl-every (lambda (char) (< char #x80)) string))
 
 (defun pgsql--saslprep-decode-utf8 (password)
   "Return PASSWORD as Unicode text, or nil when it is not valid UTF-8."
   (let ((text (if (multibyte-string-p password)
                   password
-                (decode-coding-string password 'utf-8)))
-        (position 0)
-        valid-p)
-    (setq valid-p t)
+                (decode-coding-string password 'utf-8))))
     ;; Emacs preserves malformed input as raw-byte characters above the
     ;; Unicode range.  Surrogates are valid Emacs characters but are rejected
     ;; later by PostgreSQL's prohibited table.
-    (while (and valid-p (< position (length text)))
-      (when (> (aref text position) #x10FFFF)
-        (setq valid-p nil))
-      (setq position (1+ position)))
-    (and valid-p text)))
+    (and (not (cl-some (lambda (char) (> char #x10FFFF)) text))
+         text)))
 
 (defun pgsql--saslprep-map (text)
   "Apply PostgreSQL's SASLprep mapping step to Unicode TEXT."
-  (let ((mapped (make-vector (length text) 0))
-        (input-position 0)
-        (output-position 0))
-    (while (< input-position (length text))
-      (let ((code (aref text input-position)))
-        (cond
-         ((pgsql--saslprep-in-ranges-p
-           code pgsql--saslprep-non-ascii-space-ranges)
-          (aset mapped output-position #x20)
-          (setq output-position (1+ output-position)))
-         ((pgsql--saslprep-in-ranges-p
-           code pgsql--saslprep-mapped-to-nothing-ranges))
-         (t
-          (aset mapped output-position code)
-          (setq output-position (1+ output-position)))))
-      (setq input-position (1+ input-position)))
-    (concat (substring mapped 0 output-position))))
+  (concat
+   (delq nil
+         (mapcar
+          (lambda (code)
+            (cond
+             ((pgsql--saslprep-in-ranges-p
+               code pgsql--saslprep-non-ascii-space-ranges)
+              #x20)
+             ((pgsql--saslprep-in-ranges-p
+               code pgsql--saslprep-mapped-to-nothing-ranges)
+              nil)
+             (t code)))
+          text))))
 
 (defun pgsql--saslprep-acceptable-p (text)
   "Return non-nil if mapped Unicode TEXT is acceptable to PostgreSQL."

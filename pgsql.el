@@ -36,7 +36,7 @@
 
 (require 'cl-lib)
 (require 'gnutls)
-(require 'json)
+(require 'hex-util)
 (require 'parse-time)
 (require 'pgsql-saslprep)
 (require 'subr-x)
@@ -212,16 +212,7 @@ Zero means no timeout."
      ("double precision" . 701)
      ("decimal" . 1700)
      ("character" . 1042)
-     ("character varying" . 1043)
-     ("boolean[]" . 1000)
-     ("smallint[]" . 1005)
-     ("integer[]" . 1007)
-     ("bigint[]" . 1016)
-     ("real[]" . 1021)
-     ("double precision[]" . 1022)
-     ("decimal[]" . 1231)
-     ("character[]" . 1014)
-     ("character varying[]" . 1015)))
+     ("character varying" . 1043)))
   "PostgreSQL built-in parameter type names mapped to OIDs.")
 
 (defconst pgsql--array-element-oids
@@ -277,13 +268,6 @@ Zero means no timeout."
   (when (string-search (string 0) text)
     (signal 'pgsql-error (list "PostgreSQL C strings cannot contain NUL")))
   (concat (pgsql--text-bytes text) (unibyte-string 0)))
-
-(defun pgsql--validate-sql (sql)
-  "Validate SQL for a PostgreSQL frontend query message."
-  (unless (stringp sql)
-    (signal 'wrong-type-argument (list 'stringp sql)))
-  (when (string-search (string 0) sql)
-    (signal 'pgsql-error (list "PostgreSQL SQL cannot contain NUL"))))
 
 (defun pgsql--message (type payload)
   "Return a frontend message of TYPE containing PAYLOAD."
@@ -357,20 +341,16 @@ Zero means no timeout."
       (signal 'pgsql-timeout (list "PostgreSQL response timed out")))
     (accept-process-output process remaining)))
 
-(defun pgsql--read-bytes (connection count &optional timeout deadline)
-  "Read COUNT bytes from CONNECTION within TIMEOUT or before DEADLINE."
-  (let ((deadline (or deadline
-                      (and timeout (> timeout 0) (+ (float-time) timeout))))
-        bytes)
+(defun pgsql--read-bytes (connection count deadline)
+  "Read COUNT bytes from CONNECTION before optional absolute DEADLINE."
+  (let (bytes)
     (while (not (setq bytes (pgsql--take-bytes connection count)))
       (pgsql--wait-for-input connection deadline))
     bytes))
 
-(defun pgsql--read-message (connection &optional timeout deadline)
-  "Read a CONNECTION message within TIMEOUT or before absolute DEADLINE."
-  (let ((deadline (or deadline
-                      (and timeout (> timeout 0) (+ (float-time) timeout))))
-        message)
+(defun pgsql--read-message (connection deadline)
+  "Read a CONNECTION message before optional absolute DEADLINE."
+  (let (message)
     (while (not (setq message (pgsql--take-message connection)))
       (pgsql--wait-for-input connection deadline))
     message))
@@ -484,7 +464,7 @@ LABEL identifies the operation in connection errors."
     (pgsql--send connection
                  (concat (pgsql--uint32 8) (pgsql--uint32 80877103)))
     (pcase (aref (pgsql--read-bytes
-                  connection 1 nil
+                  connection 1
                   (pgsql--connection-connect-deadline connection))
                  0)
       (?S
@@ -628,24 +608,15 @@ Return non-nil when the message was handled."
      (t (signal 'pgsql-authentication-error
                 (list "PostgreSQL password is not a string"))))))
 
-(defun pgsql--password-message (payload &optional cstring-p)
-  "Build a PasswordMessage containing PAYLOAD.
-Append a zero byte when CSTRING-P is non-nil."
-  (pgsql--message ?p
-                  (if cstring-p
-                      (concat (encode-coding-string payload 'binary t)
-                              (unibyte-string 0))
-                    (encode-coding-string payload 'binary t))))
-
 (defun pgsql--md5-password (user password salt)
   "Return PostgreSQL's MD5 response for USER, PASSWORD, and SALT."
   (concat "md5" (md5 (concat (md5 (pgsql--text-bytes (concat password user)))
                              salt))))
 
 (defun pgsql--xor-bytes (left right)
-  "Return the bytewise XOR of equal-length strings LEFT and RIGHT."
-  (unless (= (string-bytes left) (string-bytes right))
-    (signal 'pgsql-protocol-error (list "SCRAM byte strings differ in length")))
+  "Return the bytewise XOR of equal-length strings LEFT and RIGHT.
+Both callers pass 32-byte HMAC-SHA-256 output, so LEFT and RIGHT are
+always the same length."
   (let ((result (make-string (string-bytes left) 0)))
     (cl-loop for position below (length result)
              do (aset result position
@@ -661,10 +632,8 @@ Append a zero byte when CSTRING-P is non-nil."
 
 (defun pgsql--pbkdf2-sha256 (password salt iterations &optional deadline)
   "Return PBKDF2-HMAC-SHA-256 for PASSWORD, SALT, and ITERATIONS.
-When non-nil, DEADLINE bounds the synchronous computation."
-  (unless (> iterations 0)
-    (signal 'pgsql-authentication-error
-            (list "PostgreSQL SCRAM iteration count is not positive")))
+When non-nil, DEADLINE bounds the synchronous computation.  The caller
+must have already validated that ITERATIONS is positive."
   (let* ((first (pgsql--hmac-sha256
                  password (concat salt (pgsql--uint32 1))))
          (previous first)
@@ -795,22 +764,24 @@ Optional DEADLINE bounds SCRAM proof computation."
                  (list "PostgreSQL did not verify its SCRAM identity")))
        scram-state)
       (3
-       (pgsql--send connection (pgsql--password-message password t))
+       (pgsql--send connection (pgsql--message ?p (pgsql--cstring password)))
        scram-state)
       (5
        (unless (= (length payload) 8)
          (signal 'pgsql-protocol-error
                  (list "Invalid PostgreSQL MD5 authentication request")))
-       (pgsql--send connection
-                    (pgsql--password-message
-                     (pgsql--md5-password user password (substring payload 4)) t))
+       (pgsql--send
+        connection
+        (pgsql--message
+         ?p (pgsql--cstring
+             (pgsql--md5-password user password (substring payload 4)))))
        scram-state)
       (10
        (unless (member "SCRAM-SHA-256" (pgsql--cstrings payload 4))
          (signal 'pgsql-authentication-error
                  (list "PostgreSQL server offers no supported SASL mechanism")))
        (pcase-let ((`(,state . ,initial) (pgsql--scram-start user)))
-         (pgsql--send connection (pgsql--password-message initial))
+         (pgsql--send connection (pgsql--message ?p initial))
          state))
       (11
        (unless scram-state
@@ -821,7 +792,7 @@ Optional DEADLINE bounds SCRAM proof computation."
                      scram-state password
                       (decode-coding-string (substring payload 4) 'utf-8)
                       deadline)))
-         (pgsql--send connection (pgsql--password-message response))
+         (pgsql--send connection (pgsql--message ?p response))
          state))
       (12
        (unless scram-state
@@ -860,7 +831,7 @@ Optional DEADLINE bounds SCRAM proof computation."
       (pgsql--connection-database connection)
       (pgsql--connection-application-name connection)))
     (cl-loop
-     for message = (pgsql--read-message connection nil deadline)
+     for message = (pgsql--read-message connection deadline)
      for type = (car message)
      for payload = (cdr message)
      do
@@ -935,27 +906,12 @@ Optional DEADLINE bounds SCRAM proof computation."
 (defun pgsql--decode-bytea (text)
   "Decode PostgreSQL hex or escape BYTEA TEXT into an unibyte string."
   (if (string-prefix-p "\\x" text)
-      (let* ((hex (substring text 2))
-             (length (length hex))
-             (bytes (make-string (/ length 2) 0)))
-        (unless (zerop (% length 2))
+      (let ((hex (substring text 2)))
+        (unless (and (zerop (% (length hex) 2))
+                     (string-match-p "\\`[[:xdigit:]]*\\'" hex))
           (signal 'pgsql-protocol-error
-                  (list "PostgreSQL bytea value has an odd hex length")))
-        (cl-labels ((nibble (char)
-                      (cond
-                       ((and (>= char ?0) (<= char ?9)) (- char ?0))
-                       ((and (>= char ?a) (<= char ?f)) (+ 10 (- char ?a)))
-                       ((and (>= char ?A) (<= char ?F)) (+ 10 (- char ?A)))
-                       (t
-                        (signal
-                         'pgsql-protocol-error
-                         (list "PostgreSQL bytea value contains non-hex data"))))))
-          (dotimes (index (/ length 2))
-            (let ((offset (* index 2)))
-              (aset bytes index
-                    (+ (ash (nibble (aref hex offset)) 4)
-                       (nibble (aref hex (1+ offset))))))))
-        bytes)
+                  (list "PostgreSQL bytea value contains malformed hex data")))
+        (decode-hex-string hex))
     (let ((position 0)
           (count 0)
           (bytes (make-string (length text) 0)))
@@ -1131,17 +1087,10 @@ Optional DEADLINE bounds SCRAM proof computation."
   "Return VALUE as PostgreSQL's hex BYTEA text representation."
   (unless (stringp value)
     (signal 'wrong-type-argument (list 'stringp value)))
-  (let* ((bytes (if (multibyte-string-p value)
-                    (encode-coding-string value 'utf-8 t)
-                  value))
-         (digits "0123456789abcdef")
-         (hex (make-string (* 2 (length bytes)) 0)))
-    (dotimes (index (length bytes))
-      (let ((byte (aref bytes index))
-            (offset (* index 2)))
-        (aset hex offset (aref digits (ash byte -4)))
-        (aset hex (1+ offset) (aref digits (logand byte 15)))))
-    (concat "\\x" hex)))
+  (let ((bytes (if (multibyte-string-p value)
+                   (encode-coding-string value 'utf-8 t)
+                 value)))
+    (concat "\\x" (encode-hex-string bytes))))
 
 (defun pgsql--encode-scalar (value type)
   "Return the PostgreSQL text representation of VALUE for TYPE."
@@ -1212,11 +1161,13 @@ Return zero for nil or non-built-in TYPE so PostgreSQL may infer it."
     (unless (stringp type)
       (signal 'wrong-type-argument (list 'stringp type)))
     (let* ((name (downcase (string-trim type)))
-           (oid (or (alist-get name pgsql--type-oids nil nil #'string=)
-                    (and (string-suffix-p "[]" name)
-                         (alist-get (concat "_" (substring name 0 -2))
-                                    pgsql--type-oids nil nil #'string=)))))
-      (or oid 0))))
+           (array-p (string-suffix-p "[]" name))
+           (base-oid (alist-get (if array-p (substring name 0 -2) name)
+                                 pgsql--type-oids nil nil #'string=)))
+      (or (if array-p
+              (and base-oid (car (rassq base-oid pgsql--array-element-oids)))
+            base-oid)
+          0))))
 
 ;;;; Backend result parsing
 
@@ -1307,7 +1258,7 @@ Optional absolute DEADLINE bounds the whole recovery exchange."
                        (signal 'pgsql-timeout
                                (list "PostgreSQL recovery timed out")))
                      (if deadline
-                         (pgsql--read-message connection nil deadline)
+                         (pgsql--read-message connection deadline)
                        (pgsql--read-message-idle connection timeout)))
      for type = (car message)
      for payload = (cdr message)
@@ -1371,15 +1322,11 @@ Optional absolute DEADLINE bounds the whole recovery exchange."
                                 type)))))))))
 
 (defun pgsql--mark-broken (connection)
-  "Mark CONNECTION broken and release its transport resources."
-  (setf (pgsql--connection-broken-p connection) t
-        (pgsql--connection-closing-p connection) t
-        (pgsql--connection-busy-p connection) nil)
-  (when-let* ((process (pgsql--connection-process connection)))
-    (when (process-live-p process)
-      (delete-process process)))
-  (when (buffer-live-p (pgsql--connection-input-buffer connection))
-    (kill-buffer (pgsql--connection-input-buffer connection))))
+  "Mark CONNECTION broken and release its transport resources.
+Both callers hold CONNECTION busy, so `pgsql-disconnect' will not attempt
+to send a Terminate message over the presumed-unsynchronized transport."
+  (setf (pgsql--connection-broken-p connection) t)
+  (pgsql-disconnect connection))
 
 (defun pgsql--cancel-and-drain (connection)
   "Cancel CONNECTION's active request and drain it through ReadyForQuery.
@@ -1498,8 +1445,6 @@ APPLICATION-NAME is reported in the startup packet."
                 (setq connected t))
             (pgsql-error
              (signal (car err) (cdr err)))
-            (quit
-             (signal (car err) (cdr err)))
             (error
              (signal 'pgsql-connection-error
                      (list (format "PostgreSQL connection failed: %s"
@@ -1574,10 +1519,7 @@ This timeout bounds future cancellation connections.  Zero disables it."
 
 (defun pgsql-exec (connection sql)
   "Execute SQL on CONNECTION using PostgreSQL's simple-query protocol."
-  (pgsql--validate-sql sql)
-  (pgsql--request
-   connection
-   (pgsql--message ?Q (concat (pgsql--text-bytes sql) (unibyte-string 0)))))
+  (pgsql--request connection (pgsql--message ?Q (pgsql--cstring sql))))
 
 (defun pgsql-exec-params (connection sql typed-parameters)
   "Execute SQL with TYPED-PARAMETERS on CONNECTION.
@@ -1585,15 +1527,15 @@ Each parameter is a cons of VALUE and an optional PostgreSQL type name.
 Recognized built-in names are sent in Parse; PostgreSQL infers other
 types from SQL context.  Use `pgsql-null' for SQL NULL; Lisp nil is
 PostgreSQL boolean false."
-  (pgsql--validate-sql sql)
-  (let* ((encoded (mapcar #'pgsql--encode-parameter typed-parameters))
+  (let* ((sql-cstring (pgsql--cstring sql))
+         (encoded (mapcar #'pgsql--encode-parameter typed-parameters))
          (type-oids
           (mapcar (lambda (parameter)
                     (pgsql--parameter-type-oid (cdr parameter)))
                   typed-parameters))
          (parse (pgsql--message
                  ?P (concat (unibyte-string 0)
-                            (pgsql--text-bytes sql) (unibyte-string 0)
+                            sql-cstring
                             (pgsql--uint16 (length type-oids))
                             (mapconcat #'pgsql--uint32 type-oids ""))))
          (bind-payload
@@ -1665,8 +1607,6 @@ PostgreSQL boolean false."
           (when (and process (process-live-p process))
             (delete-process process))))
     (pgsql-error
-     (signal (car err) (cdr err)))
-    (quit
      (signal (car err) (cdr err)))
     (error
      (signal 'pgsql-connection-error
