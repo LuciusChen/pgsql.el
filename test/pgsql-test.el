@@ -116,27 +116,16 @@
                   :type 'pgsql-protocol-error)))
 
 (ert-deftest pgsql-test-public-values-keep-their-representation-opaque ()
-  "Public connection and result accessors should remain ordinary functions."
-  (pgsql-test--with-connection connection
-    (let ((result (pgsql--make-result
-                   :columns '((:name "answer" :type-oid 23))
-                   :rows '((42))
-                   :command-tag "SELECT 1"
-                   :affected-rows 1)))
-      (should (pgsql-connection-p connection))
-      (should (pgsql-result-p result))
-      (should (equal (pgsql-result-columns result)
-                     '((:name "answer" :type-oid 23))))
-      (should (equal (pgsql-result-rows result) '((42))))
-      (should (equal (pgsql-result-command-tag result) "SELECT 1"))
-      (should (= (pgsql-result-affected-rows result) 1))
-      (dolist (symbol '(pgsql-connection-p
-                        pgsql-result-p
-                        pgsql-result-columns
-                        pgsql-result-rows
-                        pgsql-result-command-tag
-                        pgsql-result-affected-rows))
-        (should-not (get symbol 'compiler-macro))))))
+  "Public connection and result accessors should remain ordinary functions.
+This pins the 4738f44 fix: `cl-defstruct' accessors must not carry an
+inlining compiler macro that would leak the struct's internal shape."
+  (dolist (symbol '(pgsql-connection-p
+                    pgsql-result-p
+                    pgsql-result-columns
+                    pgsql-result-rows
+                    pgsql-result-command-tag
+                    pgsql-result-affected-rows))
+    (should-not (get symbol 'compiler-macro))))
 
 (ert-deftest pgsql-test-array-codec-handles-quoting-nesting-and-null ()
   "Array codecs should preserve syntax-sensitive values and SQL NULL."
@@ -331,6 +320,30 @@
       (should-error (pgsql--scram-finish continued "v=invalid")
                     :type 'pgsql-authentication-error))))
 
+(ert-deftest pgsql-test-authentication-hashes-utf-8-under-any-coding-priority ()
+  "MD5 and SCRAM should hash non-ASCII credentials as UTF-8.
+The server hashes the UTF-8 bytes it receives, while hashing a multibyte
+string encodes it with the preferred coding system instead."
+  (with-coding-priority '(iso-latin-1)
+    (should
+     (equal
+      (pgsql--md5-password
+       "élise" "pässwörd" (unibyte-string #x12 #x34 #x56 #x78))
+      "md520f8f8a6c7e0602a99124b5c95e94331"))
+    (let ((pgsql--nonce-function (lambda () "rOprNGfwEbeRWgbNEkqO")))
+      (pcase-let* ((`(,state . ,_) (pgsql--scram-start "élise"))
+                   (`(,_ . ,response)
+                    (pgsql--scram-continue
+                     state "pässwörd"
+                     (concat
+                      "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,"
+                      "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))))
+        (should
+         (equal (decode-coding-string response 'utf-8)
+                (concat
+                 "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,"
+                 "p=fK1f8GFmTcmclxi+da4IwjfADu4MPUVODagKHQOPSLw=")))))))
+
 (ert-deftest pgsql-test-saslprep-matches-postgresql-password-semantics ()
   "SASLprep should normalize valid UTF-8 and preserve rejected input raw."
   (should (equal (pgsql--saslprep "plain ASCII") "plain ASCII"))
@@ -428,38 +441,41 @@
         (should-error (pgsql--startup connection "password")
                       :type 'pgsql-protocol-error)))))
 
-(ert-deftest pgsql-test-tls-prefer-downgrades-only-on-explicit-refusal ()
-  "TLS prefer should accept N but never hide a failed TLS handshake."
-  (pgsql-test--with-connection connection
-    (setf (pgsql--connection-sslmode connection) 'prefer)
-    (let (writes negotiated)
-      (cl-letf (((symbol-function 'gnutls-available-p) (lambda () t))
-                ((symbol-function 'pgsql--send)
-                 (lambda (_connection bytes) (push bytes writes)))
-                ((symbol-function 'pgsql--read-bytes)
-                 (lambda (&rest _arguments) (unibyte-string ?N)))
-                ((symbol-function 'gnutls-negotiate)
-                 (lambda (&rest _arguments) (setq negotiated t))))
-        (should-not (pgsql--negotiate-tls connection)))
-      (should (= (length writes) 1))
-      (should-not negotiated))
-    (setf (pgsql--connection-sslmode connection) 'require)
-    (cl-letf (((symbol-function 'gnutls-available-p) (lambda () t))
-              ((symbol-function 'pgsql--send) #'ignore)
-              ((symbol-function 'pgsql--read-bytes)
-               (lambda (&rest _arguments) (unibyte-string ?N))))
-      (should-error (pgsql--negotiate-tls connection)
-                    :type 'pgsql-connection-error))
-    (setf (pgsql--connection-sslmode connection) 'prefer)
-    (cl-letf (((symbol-function 'gnutls-available-p) (lambda () t))
-              ((symbol-function 'pgsql--send) #'ignore)
-              ((symbol-function 'pgsql--read-bytes)
-               (lambda (&rest _arguments) (unibyte-string ?S)))
-              ((symbol-function 'gnutls-negotiate)
-               (lambda (&rest _arguments)
-                 (signal 'gnutls-error '("bad certificate")))))
-      (should-error (pgsql--negotiate-tls connection)
-                    :type 'pgsql-connection-error))))
+(ert-deftest pgsql-test-tls-negotiation-handles-server-responses ()
+  "TLS negotiation should react correctly to each PostgreSQL SSL response."
+  (pcase-dolist
+      (`(,label ,sslmode ,response ,expected-error ,expect-negotiated)
+       (list
+        (list "prefer downgrades on N" 'prefer (unibyte-string ?N) nil nil)
+        (list "require rejects N" 'require (unibyte-string ?N)
+              'pgsql-connection-error nil)
+        (list "prefer surfaces a failed handshake" 'prefer
+              (unibyte-string ?S) 'pgsql-connection-error t)
+        (list "require rejects buffered plaintext after S" 'require
+              (concat (unibyte-string ?S) (unibyte-string ?X))
+              'pgsql-protocol-error nil)))
+    (ert-info (label)
+      (pgsql-test--with-connection connection
+        (setf (pgsql--connection-sslmode connection) sslmode)
+        ;; Feed the response through the real receive buffer instead of
+        ;; stubbing `pgsql--read-bytes', so the actual read path (and its
+        ;; buffered-plaintext check) runs.
+        (pgsql--receive connection response)
+        (let (writes negotiated)
+          (cl-letf (((symbol-function 'gnutls-available-p) (lambda () t))
+                    ((symbol-function 'pgsql--send)
+                     (lambda (_connection bytes) (push bytes writes)))
+                    ((symbol-function 'gnutls-negotiate)
+                     (lambda (&rest _arguments)
+                       (setq negotiated t)
+                       (signal 'gnutls-error '("bad certificate")))))
+            (if expected-error
+                (should-error (pgsql--negotiate-tls connection)
+                              :type expected-error)
+              (should-not (pgsql--negotiate-tls connection))))
+          (should (eq (and negotiated t) expect-negotiated))
+          (unless expected-error
+            (should (= (length writes) 1))))))))
 
 (ert-deftest pgsql-test-server-errors-retain-structured-fields ()
   "Server errors should expose stable SQLSTATE and diagnostic fields."
@@ -478,18 +494,6 @@
       (pgsql-server-error (setq caught error-value)))
     (should caught)
     (should (equal (pgsql-error-fields caught) fields))))
-
-(ert-deftest pgsql-test-tls-rejects-buffered-plaintext-after-acceptance ()
-  "TLS acceptance followed by buffered plaintext is a protocol violation."
-  (pgsql-test--with-connection connection
-    (setf (pgsql--connection-sslmode connection) 'require)
-    (pgsql--receive connection (unibyte-string ?X))
-    (cl-letf (((symbol-function 'gnutls-available-p) (lambda () t))
-              ((symbol-function 'pgsql--send) #'ignore)
-              ((symbol-function 'pgsql--read-bytes)
-               (lambda (&rest _) (unibyte-string ?S))))
-      (should-error (pgsql--negotiate-tls connection)
-                    :type 'pgsql-protocol-error))))
 
 (ert-deftest pgsql-test-extended-request-is-one-exact-write ()
   "Extended execution should batch Parse through Sync in one transport write."
@@ -572,35 +576,39 @@
         (should-not (pgsql-busy-p connection))
         (should-not (pgsql--connection-broken-p connection))))))
 
-(ert-deftest pgsql-test-unsynchronized-failure-breaks-connection ()
-  "A request failure before ReadyForQuery should close the connection."
-  (pgsql-test--with-connection connection
-    (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
-              ((symbol-function 'process-send-string) #'ignore)
-              ((symbol-function 'delete-process) #'ignore)
-              ((symbol-function 'pgsql--collect-result)
-               (lambda (_connection)
-                 (signal 'pgsql-protocol-error '("truncated response")))))
-      (should-error (pgsql-exec connection "SELECT 1")
-                    :type 'pgsql-protocol-error))
-    (should (pgsql--connection-broken-p connection))
-    (should (pgsql--connection-closing-p connection))
-    (should-not (pgsql-busy-p connection))
-    (should-not (buffer-live-p (pgsql--connection-input-buffer connection)))))
-
-(ert-deftest pgsql-test-nonlocal-request-exit-breaks-connection ()
-  "A nonlocal exit before ReadyForQuery should still clean request state."
-  (pgsql-test--with-connection connection
-    (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
-              ((symbol-function 'process-send-string) #'ignore)
-              ((symbol-function 'delete-process) #'ignore)
-              ((symbol-function 'pgsql--collect-result)
-               (lambda (_connection) (throw 'outside :escaped))))
-      (should (eq (catch 'outside (pgsql-exec connection "SELECT 1"))
-                  :escaped)))
-    (should (pgsql--connection-broken-p connection))
-    (should-not (pgsql-busy-p connection))
-    (should-not (buffer-live-p (pgsql--connection-input-buffer connection)))))
+(ert-deftest pgsql-test-unsynchronized-exit-breaks-connection ()
+  "A request that exits before ReadyForQuery should mark the connection broken.
+This must hold, and write nothing beyond the original request, whether
+the collector signals a protocol error or performs a nonlocal exit."
+  (pcase-dolist (`(,exit . ,expected)
+                 (list
+                  (cons (lambda (_connection)
+                          (signal 'pgsql-protocol-error '("truncated response")))
+                        :protocol-error)
+                  (cons (lambda (_connection) (throw 'outside :escaped))
+                        :escaped)))
+    (ert-info ((format "expected: %S" expected))
+      (pgsql-test--with-connection connection
+        (let (writes)
+          (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                    ((symbol-function 'process-send-string)
+                     (lambda (_process bytes) (push bytes writes)))
+                    ((symbol-function 'delete-process) #'ignore)
+                    ((symbol-function 'pgsql--collect-result) exit))
+            (should
+             (eq (catch 'outside
+                   (condition-case _err
+                       (pgsql-exec connection "SELECT 1")
+                     (pgsql-protocol-error :protocol-error)))
+                 expected)))
+          (should (equal writes
+                         (list (pgsql-test--message
+                                ?Q (pgsql-test--bytes "SELECT 1\0")))))
+          (should (pgsql--connection-broken-p connection))
+          (should (pgsql--connection-closing-p connection))
+          (should-not (pgsql-busy-p connection))
+          (should-not
+           (buffer-live-p (pgsql--connection-input-buffer connection))))))))
 
 (ert-deftest pgsql-test-ready-without-result-breaks-connection ()
   "ReadyForQuery alone must not manufacture a successful query result."

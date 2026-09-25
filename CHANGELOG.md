@@ -2,6 +2,12 @@
 
 Notable user-visible changes are recorded here.
 
+## Unreleased
+
+### Fixed
+
+- MD5 and SCRAM-SHA-256 authentication with a non-ASCII password or user name failed whenever Emacs preferred a coding system other than UTF-8: the credentials were hashed in that coding system instead of as the UTF-8 bytes sent to the server.
+
 ## 0.1.0 - 2026-08-17
 
 ### Added

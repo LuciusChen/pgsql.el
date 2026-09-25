@@ -279,6 +279,14 @@ Skip the current test when required live-test configuration is absent."
   "Track ReadyForQuery I, T, and E and reuse the connection after rollback."
   (pgsql-live-test--with-connection connection
     (should (eq (pgsql-transaction-status connection) 'idle))
+    (let* ((error-value
+            (should-error
+             (pgsql-exec connection "SELECT 'not-an-integer'::integer")
+             :type 'pgsql-server-error))
+           (fields (pgsql-error-fields error-value)))
+      (should (equal (plist-get fields :sqlstate) "22P02")))
+    (should (eq (pgsql-transaction-status connection) 'idle))
+    (should-not (pgsql-busy-p connection))
     (pgsql-exec connection "BEGIN")
     (should (eq (pgsql-transaction-status connection) 'in-transaction))
     (let* ((error-value
@@ -293,22 +301,6 @@ Skip the current test when required live-test configuration is absent."
                     (pgsql-exec connection "SELECT 7::int4"))
                    '((7))))
     (should (pgsql-live-p connection))))
-
-(ert-deftest pgsql-live-test-server-error-keeps-autocommit-connection-reusable ()
-  :tags '(:live)
-  "Drain a server error through ReadyForQuery before reusing the connection."
-  (pgsql-live-test--with-connection connection
-    (let* ((error-value
-            (should-error
-             (pgsql-exec connection "SELECT 'not-an-integer'::integer")
-             :type 'pgsql-server-error))
-           (fields (pgsql-error-fields error-value)))
-      (should (equal (plist-get fields :sqlstate) "22P02")))
-    (should (eq (pgsql-transaction-status connection) 'idle))
-    (should-not (pgsql-busy-p connection))
-    (should (equal (pgsql-result-rows
-                    (pgsql-exec connection "SELECT 8::int4"))
-                   '((8))))))
 
 (ert-deftest pgsql-live-test-cancel-keeps-connection-reusable ()
   :tags '(:live)
