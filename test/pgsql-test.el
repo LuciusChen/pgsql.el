@@ -331,6 +331,30 @@
       (should-error (pgsql--scram-finish continued "v=invalid")
                     :type 'pgsql-authentication-error))))
 
+(ert-deftest pgsql-test-authentication-hashes-utf-8-under-any-coding-priority ()
+  "MD5 and SCRAM should hash non-ASCII credentials as UTF-8.
+The server hashes the UTF-8 bytes it receives, while hashing a multibyte
+string encodes it with the preferred coding system instead."
+  (with-coding-priority '(iso-latin-1)
+    (should
+     (equal
+      (pgsql--md5-password
+       "élise" "pässwörd" (unibyte-string #x12 #x34 #x56 #x78))
+      "md520f8f8a6c7e0602a99124b5c95e94331"))
+    (let ((pgsql--nonce-function (lambda () "rOprNGfwEbeRWgbNEkqO")))
+      (pcase-let* ((`(,state . ,_) (pgsql--scram-start "élise"))
+                   (`(,_ . ,response)
+                    (pgsql--scram-continue
+                     state "pässwörd"
+                     (concat
+                      "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,"
+                      "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))))
+        (should
+         (equal (decode-coding-string response 'utf-8)
+                (concat
+                 "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,"
+                 "p=fK1f8GFmTcmclxi+da4IwjfADu4MPUVODagKHQOPSLw=")))))))
+
 (ert-deftest pgsql-test-saslprep-matches-postgresql-password-semantics ()
   "SASLprep should normalize valid UTF-8 and preserve rejected input raw."
   (should (equal (pgsql--saslprep "plain ASCII") "plain ASCII"))

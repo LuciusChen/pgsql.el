@@ -639,7 +639,8 @@ Append a zero byte when CSTRING-P is non-nil."
 
 (defun pgsql--md5-password (user password salt)
   "Return PostgreSQL's MD5 response for USER, PASSWORD, and SALT."
-  (concat "md5" (md5 (concat (md5 (concat password user)) salt))))
+  (concat "md5" (md5 (concat (md5 (pgsql--text-bytes (concat password user)))
+                             salt))))
 
 (defun pgsql--xor-bytes (left right)
   "Return the bytewise XOR of equal-length strings LEFT and RIGHT."
@@ -743,17 +744,18 @@ Use PASSWORD to compute the client proof before optional DEADLINE."
                     (signal 'pgsql-authentication-error
                             (list "Invalid PostgreSQL SCRAM salt")))))
            (iterations (string-to-number iterations-text))
-           (prepared-password (pgsql--saslprep password))
+           (prepared-password (pgsql--text-bytes (pgsql--saslprep password)))
            (salted (pgsql--pbkdf2-sha256
                     prepared-password salt iterations deadline))
            (client-key (pgsql--hmac-sha256 salted "Client Key"))
            (stored-key (secure-hash 'sha256 client-key nil nil t))
            (server-key (pgsql--hmac-sha256 salted "Server Key"))
            (final-bare (format "c=biws,r=%s" nonce))
-           (auth-message (string-join
-                          (list (plist-get state :client-first-bare)
-                                server-first final-bare)
-                          ","))
+           (auth-message (pgsql--text-bytes
+                          (string-join
+                           (list (plist-get state :client-first-bare)
+                                 server-first final-bare)
+                           ",")))
            (client-signature (pgsql--hmac-sha256 stored-key auth-message))
            (proof (pgsql--xor-bytes client-key client-signature))
            (server-signature (pgsql--hmac-sha256 server-key auth-message))
