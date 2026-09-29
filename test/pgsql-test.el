@@ -539,6 +539,40 @@ string encodes it with the preferred coding system instead."
       (should (equal (car writes) expected))
       (should-not (pgsql-busy-p connection)))))
 
+(ert-deftest pgsql-test-extended-request-frames-multibyte-ascii-as-bytes ()
+  "Multibyte ASCII SQL and parameters should keep exact message lengths."
+  (pgsql-test--with-connection connection
+    (let* ((long-text (make-string 200 ?a))
+           (parse-payload
+            (concat (unibyte-string 0)
+                    (pgsql-test--bytes "SELECT $1, $2")
+                    (unibyte-string 0)
+                    (pgsql-test--uint16 2)
+                    (pgsql-test--uint32 1007)
+                    (pgsql-test--uint32 25)))
+           (bind-payload
+            (concat (unibyte-string 0 0 0 0 0 2)
+                    (pgsql-test--uint32 5) (pgsql-test--bytes "{5,7}")
+                    (pgsql-test--uint32 200) long-text
+                    (unibyte-string 0 0)))
+           (expected
+            (concat (pgsql-test--message ?P parse-payload)
+                    (pgsql-test--message ?B bind-payload)
+                    (pgsql-test--message ?D (unibyte-string ?P 0))
+                    (pgsql-test--message ?E (unibyte-string 0 0 0 0 0))
+                    (pgsql-test--message ?S "")))
+           writes)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'process-send-string)
+                 (lambda (_process bytes) (push bytes writes)))
+                ((symbol-function 'pgsql--collect-result)
+                 (lambda (_connection) (cons (pgsql--make-result) nil))))
+        (pgsql-exec-params
+         connection (string-to-multibyte "SELECT $1, $2")
+         (list (cons [5 7] "_int4")
+               (cons (string-to-multibyte long-text) "text"))))
+      (should (equal writes (list expected))))))
+
 (ert-deftest pgsql-test-error-drains-to-ready-before-reuse ()
   "A server error should signal only after synchronization and permit reuse."
   (pgsql-test--with-connection connection
