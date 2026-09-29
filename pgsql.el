@@ -261,7 +261,8 @@ Zero means no timeout."
 
 (defun pgsql--text-bytes (text)
   "Encode TEXT as unibyte UTF-8."
-  (encode-coding-string text 'utf-8 t))
+  ;; With NOCOPY, pure-ASCII multibyte TEXT would come back multibyte.
+  (encode-coding-string text 'utf-8))
 
 (defun pgsql--cstring (text)
   "Encode TEXT as a UTF-8 C string."
