@@ -26,7 +26,7 @@ The package is protocol-only. Query consoles, result rendering, completion, sche
 
 MELPA already provides [[https://github.com/emarsden/pg-el][pg.el]], a mature and broad PostgreSQL client with COPY support, asynchronous idle LISTEN/NOTIFY handling, Unix-domain sockets, extensible type decoding, and a large server-compatibility matrix. =pgsql.el= is not a fork or drop-in replacement and does not try to match that feature breadth; applications that need those capabilities should use pg.el.
 
-=pgsql.el= provides a narrower protocol-library boundary for synchronous application clients: no third-party runtime dependency, opaque connection and result values, one request in flight, completion only after the matching =ReadyForQuery= has been consumed, authoritative public transaction state, a dedicated SQL NULL value distinct from PostgreSQL false, and bounded cancellation that drains the original connection before reuse. Those lifecycle guarantees let callers such as Clutch depend on public protocol state without reaching into transport internals or maintaining caller-side synchronization workarounds.
+=pgsql.el= provides a narrower protocol-library boundary for application clients: no third-party runtime dependency, opaque connection and result values, one request in flight, completion only after the matching =ReadyForQuery= has been consumed, authoritative public transaction state, a dedicated SQL NULL value distinct from PostgreSQL false, and bounded cancellation that drains the original connection before reuse. Those lifecycle guarantees let callers such as Clutch depend on public protocol state without reaching into transport internals or maintaining caller-side synchronization workarounds.
 
 * Requirements
 
@@ -90,7 +90,7 @@ Recognized built-in type names are sent as Parse OIDs. Unknown, extension, and d
 
 Both query functions consume the complete response through =ReadyForQuery= before returning or signaling. =pgsql-transaction-status= reports =idle=, =in-transaction=, or =failed-transaction= from that server message. A structured =pgsql-server-error= retains fields such as =:sqlstate=, =:detail=, and =:constraint= through =pgsql-error-fields=, and the same connection remains reusable after a synchronized server error.
 
-=NotificationResponse= messages encountered while reading a response are delivered through =pgsql-notification-functions= with the connection and a plist containing =:pid=, =:channel=, and =:payload=. The synchronous client does not poll or dispatch messages while a connection is idle.
+=NotificationResponse= messages encountered while reading a response are delivered through =pgsql-notification-functions= with the connection and a plist containing =:pid=, =:channel=, and =:payload=. =pgsql.el= does not poll or dispatch messages while a connection is idle.
 
 Results expose =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, and =pgsql-result-affected-rows=. Column metadata is read through =pgsql-column-name=, =pgsql-column-type-oid=, and =pgsql-column-type-name=. Core scalar and array values are decoded from PostgreSQL text format; binary result columns are rejected explicitly rather than guessed. Unknown types remain UTF-8 strings with their OID preserved in the column metadata. Arbitrary-precision =numeric= and wall-clock =date=/=timestamp= values remain exact text, while =timestamptz= becomes an Emacs time value. =bytea= parameters and results use unibyte strings and accept either PostgreSQL hex or escape output.
 
