@@ -358,5 +358,62 @@ Skip the current test when required live-test configuration is absent."
         (when timer
           (cancel-timer timer))))))
 
+(defun pgsql-live-test--await (predicate)
+  "Process input and timers until PREDICATE is non-nil, for at most 10 seconds."
+  (let ((deadline (+ (float-time) 10)))
+    (while (not (funcall predicate))
+      (when (> (float-time) deadline)
+        (ert-fail "Timed out waiting for an asynchronous request"))
+      (accept-process-output nil 0.05))))
+
+(ert-deftest pgsql-live-test-async-requests-return-before-the-server-answers ()
+  :tags '(:live)
+  "Asynchronous requests should return at once and leave timers running."
+  (pgsql-live-test--with-connection connection
+    (let (outcome timer-saw-pending)
+      (should-not
+       (pgsql-exec-params-async
+        connection "SELECT $1::int4[] FROM pg_sleep(0.5)"
+        (list (cons [5 7] "_int4"))
+        (lambda (result error) (setq outcome (list result error)))))
+      (should (pgsql-busy-p connection))
+      (run-at-time 0.1 nil
+                   (lambda ()
+                     (setq timer-saw-pending (pgsql-busy-p connection))))
+      (pgsql-live-test--await (lambda () outcome))
+      (should timer-saw-pending)
+      (should-not (cadr outcome))
+      (should (equal (pgsql-result-rows (car outcome)) '(([5 7]))))
+      (setq outcome nil)
+      (pgsql-exec-async connection "SELECT 12::int4"
+                        (lambda (result error) (setq outcome (list result error))))
+      (pgsql-live-test--await (lambda () outcome))
+      (should (equal (pgsql-result-rows (car outcome)) '((12))))
+      (should (equal (pgsql-result-rows
+                      (pgsql-exec connection "SELECT 13::int4"))
+                     '((13))))
+      (should (pgsql-live-p connection)))))
+
+(ert-deftest pgsql-live-test-async-cancel-reports-the-server-verdict ()
+  :tags '(:live)
+  "Cancelling an asynchronous request should finish it with the server error."
+  (pgsql-live-test--with-connection connection
+    (let (outcome)
+      (pgsql-exec-async connection "SELECT pg_sleep(30)"
+                        (lambda (result error) (setq outcome (list result error))))
+      ;; A cancel that arrives before execution starts would be ignored.
+      (sleep-for 0.2)
+      (should (pgsql-cancel connection))
+      (pgsql-live-test--await (lambda () outcome))
+      (should-not (car outcome))
+      (should (equal (plist-get (pgsql-error-fields (cadr outcome)) :sqlstate)
+                     "57014"))
+      (should-not (pgsql-busy-p connection))
+      (should (eq (pgsql-transaction-status connection) 'idle))
+      (should (equal (pgsql-result-rows
+                      (pgsql-exec connection "SELECT 14::int4"))
+                     '((14))))
+      (should (pgsql-live-p connection)))))
+
 (provide 'pgsql-live-test)
 ;;; pgsql-live-test.el ends here

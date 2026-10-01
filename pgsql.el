@@ -124,7 +124,8 @@ Zero means no timeout."
   transaction-status
   busy-p
   broken-p
-  closing-p)
+  closing-p
+  pending)
 
 (cl-defstruct (pgsql-result
                (:constructor pgsql--make-result)
@@ -136,6 +137,20 @@ Zero means no timeout."
   rows
   command-tag
   affected-rows)
+
+(cl-defstruct (pgsql--response
+               (:constructor pgsql--make-response)
+               (:copier nil))
+  "Progress of one response read through ReadyForQuery.
+CALLBACK is set only for an asynchronous request."
+  columns
+  rows
+  final-columns
+  final-rows
+  command-tag
+  server-error
+  terminal-seen
+  callback)
 
 (defun pgsql-connection-p (value)
   "Return non-nil when VALUE is a PostgreSQL connection."
@@ -277,11 +292,14 @@ Zero means no timeout."
           payload))
 
 (defun pgsql--receive (connection bytes)
-  "Append process filter BYTES to CONNECTION without parsing them."
+  "Append process filter BYTES to CONNECTION.
+A pending asynchronous request then consumes every complete message."
   (when (buffer-live-p (pgsql--connection-input-buffer connection))
     (with-current-buffer (pgsql--connection-input-buffer connection)
       (goto-char (point-max))
-      (insert (encode-coding-string bytes 'binary t)))))
+      (insert (encode-coding-string bytes 'binary t)))
+    (when (pgsql--connection-pending connection)
+      (pgsql--advance-async connection))))
 
 (defun pgsql--available-bytes (connection)
   "Return unread byte count buffered for CONNECTION."
@@ -406,13 +424,19 @@ Progress receiving a fragmented message restarts the timeout."
              (not (pgsql--connection-closing-p connection))
              (memq (process-status process) '(closed failed exit signal)))
     (setf (pgsql--connection-broken-p connection) t)
-    ;; An active request owns cleanup so it may first consume bytes already
-    ;; delivered by the process filter.  With no request, nothing can consume
-    ;; the hidden input buffer after the peer disappears.
-    (unless (pgsql--connection-busy-p connection)
-      (setf (pgsql--connection-closing-p connection) t)
-      (when (buffer-live-p (pgsql--connection-input-buffer connection))
-        (kill-buffer (pgsql--connection-input-buffer connection))))))
+    (if-let* ((response (pgsql--connection-pending connection)))
+        ;; The filter has already consumed every delivered message, and no
+        ;; caller waits on an asynchronous request, so finish it here.
+        (pgsql--finish-async
+         connection response nil
+         '(pgsql-connection-error "PostgreSQL connection closed while reading"))
+      ;; An active request owns cleanup so it may first consume bytes already
+      ;; delivered by the process filter.  With no request, nothing can consume
+      ;; the hidden input buffer after the peer disappears.
+      (unless (pgsql--connection-busy-p connection)
+        (setf (pgsql--connection-closing-p connection) t)
+        (when (buffer-live-p (pgsql--connection-input-buffer connection))
+          (kill-buffer (pgsql--connection-input-buffer connection)))))))
 
 (defun pgsql--await-process-open (process deadline label)
   "Wait until DEADLINE for PROCESS to connect.
@@ -543,10 +567,14 @@ LABEL identifies the operation in connection errors."
                                   (and sqlstate (format "[%s]" sqlstate))))
                  ": ")))
 
+(defun pgsql--server-error-condition (fields)
+  "Return the `pgsql-server-error' condition for structured FIELDS."
+  (list 'pgsql-server-error (pgsql--server-error-message fields) fields))
+
 (defun pgsql--signal-server-error (fields)
   "Signal a structured server error using FIELDS."
-  (signal 'pgsql-server-error
-          (list (pgsql--server-error-message fields) fields)))
+  (let ((condition (pgsql--server-error-condition fields)))
+    (signal (car condition) (cdr condition))))
 
 (defun pgsql-error-fields (error-value)
   "Return structured fields from caught PostgreSQL ERROR-VALUE.
@@ -1245,86 +1273,97 @@ Return zero for nil or non-built-in TYPE so PostgreSQL may infer it."
              (string-match "\\(?:^\\| \\)\\([0-9]+\\)\\'" command-tag))
     (string-to-number (match-string 1 command-tag))))
 
+(defun pgsql--response-step (connection response message)
+  "Apply backend MESSAGE from CONNECTION to RESPONSE.
+Return a cons of result and structured server error fields once
+ReadyForQuery ends RESPONSE, and nil before then."
+  (let ((type (car message))
+        (payload (cdr message)))
+    (if (eq type ?Z)
+        (let ((command-tag (pgsql--response-command-tag response)))
+          (unless (pgsql--response-terminal-seen response)
+            (signal 'pgsql-protocol-error
+                    (list "PostgreSQL response ended without a query result")))
+          (setf (pgsql--connection-transaction-status connection)
+                (pgsql--ready-status payload))
+          (cons (pgsql--make-result
+                 :columns (pgsql--response-final-columns response)
+                 :rows (pgsql--response-final-rows response)
+                 :command-tag command-tag
+                 :affected-rows (pgsql--affected-rows command-tag))
+                (pgsql--response-server-error response)))
+      (pcase type
+        (?T
+         (setf (pgsql--response-columns response) (pgsql--parse-columns payload)
+               (pgsql--response-rows response) nil
+               (pgsql--response-terminal-seen response) nil))
+        (?D
+         (let ((columns (pgsql--response-columns response)))
+           (unless columns
+             (signal 'pgsql-protocol-error
+                     (list "PostgreSQL sent DataRow before RowDescription")))
+           (push (pgsql--parse-row payload columns)
+                 (pgsql--response-rows response))))
+        (?C
+         (pcase (pgsql--cstrings payload)
+           (`(,tag)
+            (setf (pgsql--response-command-tag response) tag
+                  (pgsql--response-final-columns response)
+                  (pgsql--response-columns response)
+                  (pgsql--response-final-rows response)
+                  (nreverse (pgsql--response-rows response))
+                  (pgsql--response-columns response) nil
+                  (pgsql--response-rows response) nil
+                  (pgsql--response-terminal-seen response) t))
+           (_ (signal 'pgsql-protocol-error
+                      (list "Invalid PostgreSQL CommandComplete")))))
+        (?I
+         (unless (zerop (length payload))
+           (signal 'pgsql-protocol-error
+                   (list "Invalid PostgreSQL EmptyQueryResponse")))
+         (setf (pgsql--response-command-tag response) "EMPTY"
+               (pgsql--response-final-columns response) nil
+               (pgsql--response-final-rows response) nil
+               (pgsql--response-columns response) nil
+               (pgsql--response-rows response) nil
+               (pgsql--response-terminal-seen response) t))
+        (?E
+         (unless (pgsql--response-server-error response)
+           (setf (pgsql--response-server-error response)
+                 (pgsql--error-fields payload)))
+         (setf (pgsql--response-terminal-seen response) t))
+        ((or ?1 ?2 ?3 ?n)
+         (unless (zerop (length payload))
+           (signal 'pgsql-protocol-error
+                   (list "Invalid PostgreSQL completion message"))))
+        (_
+         (unless (pgsql--handle-side-message connection type payload)
+           (signal 'pgsql-protocol-error
+                   (list (format "Unexpected PostgreSQL query message: %c"
+                                 type))))))
+      nil)))
+
 (defun pgsql--collect-result (connection &optional deadline)
   "Collect one CONNECTION response through ReadyForQuery.
 Return a cons of result and structured server error fields.
 Optional absolute DEADLINE bounds the whole recovery exchange."
   (let ((timeout (pgsql--connection-read-timeout connection))
-        columns rows
-        final-columns final-rows command-tag server-error terminal-seen)
-    (cl-loop
-     for message = (progn
-                     (when (and deadline
-                                (zerop (pgsql--remaining-time deadline)))
-                       (signal 'pgsql-timeout
-                               (list "PostgreSQL recovery timed out")))
-                     (if deadline
-                         (pgsql--read-message connection deadline)
-                       (pgsql--read-message-idle connection timeout)))
-     for type = (car message)
-     for payload = (cdr message)
-     do
-     (pcase type
-       (?T
-        (setq columns (pgsql--parse-columns payload)
-              rows nil
-              terminal-seen nil))
-       (?D
-        (unless columns
-          (signal 'pgsql-protocol-error
-                  (list "PostgreSQL sent DataRow before RowDescription")))
-        (push (pgsql--parse-row payload columns) rows))
-       (?C
-        (pcase (pgsql--cstrings payload)
-          (`(,tag)
-           (setq command-tag tag
-                 final-columns columns
-                 final-rows (nreverse rows)
-                 columns nil
-                 rows nil
-                 terminal-seen t))
-          (_ (signal 'pgsql-protocol-error
-                     (list "Invalid PostgreSQL CommandComplete")))))
-       (?I
-        (unless (zerop (length payload))
-          (signal 'pgsql-protocol-error
-                  (list "Invalid PostgreSQL EmptyQueryResponse")))
-        (setq command-tag "EMPTY"
-              final-columns nil
-              final-rows nil
-              columns nil
-              rows nil
-              terminal-seen t))
-       (?E
-        (unless server-error
-          (setq server-error (pgsql--error-fields payload)))
-        (setq terminal-seen t))
-       (?Z
-        (unless terminal-seen
-          (signal 'pgsql-protocol-error
-                  (list "PostgreSQL response ended without a query result")))
-        (setf (pgsql--connection-transaction-status connection)
-              (pgsql--ready-status payload))
-        (cl-return
-         (cons (pgsql--make-result
-                :columns final-columns
-                :rows final-rows
-                :command-tag command-tag
-                :affected-rows (pgsql--affected-rows command-tag))
-               server-error)))
-       ((or ?1 ?2 ?3 ?n)
-        (unless (zerop (length payload))
-          (signal 'pgsql-protocol-error
-                  (list "Invalid PostgreSQL completion message"))))
-       (_
-        (unless (pgsql--handle-side-message connection type payload)
-          (signal 'pgsql-protocol-error
-                  (list (format "Unexpected PostgreSQL query message: %c"
-                                type)))))))))
+        (response (pgsql--make-response))
+        outcome)
+    (while (not outcome)
+      (when (and deadline (zerop (pgsql--remaining-time deadline)))
+        (signal 'pgsql-timeout (list "PostgreSQL recovery timed out")))
+      (setq outcome
+            (pgsql--response-step
+             connection response
+             (if deadline
+                 (pgsql--read-message connection deadline)
+               (pgsql--read-message-idle connection timeout)))))
+    outcome))
 
 (defun pgsql--mark-broken (connection)
   "Mark CONNECTION broken and release its transport resources.
-Both callers hold CONNECTION busy, so `pgsql-disconnect' will not attempt
+Every caller holds CONNECTION busy, so `pgsql-disconnect' will not attempt
 to send a Terminate message over the presumed-unsynchronized transport."
   (setf (pgsql--connection-broken-p connection) t)
   (pgsql-disconnect connection))
@@ -1375,6 +1414,62 @@ Return non-nil only when the connection is synchronized again."
       (if synchronized
           (setf (pgsql--connection-busy-p connection) nil)
         (pgsql--mark-broken connection)))))
+
+(defun pgsql--request-async (connection bytes callback)
+  "Send request BYTES on CONNECTION and return without waiting.
+CALLBACK is called as described in `pgsql-exec-async'."
+  (unless (pgsql-live-p connection)
+    (signal 'pgsql-connection-error (list "PostgreSQL connection is not live")))
+  (when (pgsql--connection-busy-p connection)
+    (signal 'pgsql-connection-error (list "PostgreSQL connection is busy")))
+  (setf (pgsql--connection-busy-p connection) t
+        (pgsql--connection-pending connection)
+        (pgsql--make-response :callback callback))
+  (condition-case err
+      (pgsql--send connection bytes)
+    (error
+     (setf (pgsql--connection-pending connection) nil)
+     (pgsql--mark-broken connection)
+     (signal 'pgsql-connection-error
+             (list (format "PostgreSQL request failed: %s"
+                           (error-message-string err))))))
+  nil)
+
+(defun pgsql--advance-async (connection)
+  "Apply every complete buffered message to CONNECTION's pending request."
+  (let ((response (pgsql--connection-pending connection))
+        outcome message)
+    (condition-case err
+        (progn
+          (while (and (not outcome)
+                      (setq message (pgsql--take-message connection)))
+            (setq outcome (pgsql--response-step connection response message)))
+          (when outcome
+            (pgsql--finish-async connection response outcome nil)))
+      (pgsql-error
+       (pgsql--finish-async connection response nil err))
+      (error
+       (pgsql--finish-async
+        connection response nil
+        (list 'pgsql-connection-error
+              (format "PostgreSQL request failed: %s"
+                      (error-message-string err))))))))
+
+(defun pgsql--finish-async (connection response outcome error)
+  "Finish CONNECTION's pending RESPONSE once, from OUTCOME or ERROR.
+OUTCOME is a synchronized cons of result and server error fields.
+ERROR is a condition after which CONNECTION cannot be synchronized, so
+it is closed.  The callback runs from a timer, outside the filter."
+  (when (eq response (pgsql--connection-pending connection))
+    (setf (pgsql--connection-pending connection) nil)
+    (if error
+        (pgsql--mark-broken connection)
+      (setf (pgsql--connection-busy-p connection) nil))
+    (run-at-time 0 nil (pgsql--response-callback response)
+                 (and outcome (not (cdr outcome)) (car outcome))
+                 (or error
+                     (and (cdr outcome)
+                          (pgsql--server-error-condition (cdr outcome)))))))
 
 ;;;; Public connection and query API
 
@@ -1504,18 +1599,24 @@ This timeout bounds future cancellation connections.  Zero disables it."
   (pgsql--connection-database connection))
 
 (defun pgsql-disconnect (connection)
-  "Close CONNECTION and release its process and input buffer."
+  "Close CONNECTION and release its process and input buffer.
+A pending asynchronous request completes with a connection error."
   (when (pgsql-connection-p connection)
-    (setf (pgsql--connection-closing-p connection) t)
-    (when-let* ((process (pgsql--connection-process connection)))
-      (when (process-live-p process)
-        (unless (pgsql--connection-busy-p connection)
-          (ignore-error process-error
-            (process-send-string process (pgsql--message ?X ""))))
-        (delete-process process)))
-    (when (buffer-live-p (pgsql--connection-input-buffer connection))
-      (kill-buffer (pgsql--connection-input-buffer connection)))
-    (setf (pgsql--connection-busy-p connection) nil))
+    (if-let* ((response (pgsql--connection-pending connection)))
+        ;; Finishing with an error closes CONNECTION through this function.
+        (pgsql--finish-async connection response nil
+                             '(pgsql-connection-error
+                               "PostgreSQL connection closed"))
+      (setf (pgsql--connection-closing-p connection) t)
+      (when-let* ((process (pgsql--connection-process connection)))
+        (when (process-live-p process)
+          (unless (pgsql--connection-busy-p connection)
+            (ignore-error process-error
+              (process-send-string process (pgsql--message ?X ""))))
+          (delete-process process)))
+      (when (buffer-live-p (pgsql--connection-input-buffer connection))
+        (kill-buffer (pgsql--connection-input-buffer connection)))
+      (setf (pgsql--connection-busy-p connection) nil)))
   nil)
 
 (defun pgsql-exec (connection sql)
@@ -1528,6 +1629,32 @@ Each parameter is a cons of VALUE and an optional PostgreSQL type name.
 Recognized built-in names are sent in Parse; PostgreSQL infers other
 types from SQL context.  Use `pgsql-null' for SQL NULL; Lisp nil is
 PostgreSQL boolean false."
+  (pgsql--request connection (pgsql--extended-query sql typed-parameters)))
+
+(defun pgsql-exec-async (connection sql callback)
+  "Start SQL on CONNECTION with the simple-query protocol and return nil.
+CALLBACK is called exactly once, from a timer, with RESULT and ERROR.
+On success RESULT is a `pgsql-result' and ERROR is nil.  Otherwise
+RESULT is nil and ERROR is an error condition: after a
+`pgsql-server-error' CONNECTION is synchronized and reusable, and after
+any other condition CONNECTION is closed.  CONNECTION stays busy until
+the callback is scheduled, so it is idle when CALLBACK runs.
+`pgsql-cancel' asks the server to stop the command, which then completes
+with the server's verdict.  The read timeout does not apply.  When the
+request cannot be sent, signal at once without calling CALLBACK;
+CONNECTION is then closed."
+  (pgsql--request-async
+   connection (pgsql--message ?Q (pgsql--cstring sql)) callback))
+
+(defun pgsql-exec-params-async (connection sql typed-parameters callback)
+  "Start SQL with TYPED-PARAMETERS on CONNECTION and return nil.
+TYPED-PARAMETERS are as for `pgsql-exec-params', and CALLBACK is called
+as described in `pgsql-exec-async'."
+  (pgsql--request-async
+   connection (pgsql--extended-query sql typed-parameters) callback))
+
+(defun pgsql--extended-query (sql typed-parameters)
+  "Return the Parse through Sync request for SQL with TYPED-PARAMETERS."
   (let* ((sql-cstring (pgsql--cstring sql))
          (encoded (mapcar #'pgsql--encode-parameter typed-parameters))
          (type-oids
@@ -1557,7 +1684,7 @@ PostgreSQL boolean false."
                                   (concat (unibyte-string 0)
                                           (pgsql--uint32 0))))
          (sync (pgsql--message ?S "")))
-    (pgsql--request connection (concat parse bind describe execute sync))))
+    (concat parse bind describe execute sync)))
 
 (defun pgsql-escape-identifier (identifier)
   "Quote PostgreSQL IDENTIFIER."

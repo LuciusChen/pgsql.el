@@ -54,6 +54,10 @@
        (when (buffer-live-p input)
          (kill-buffer input)))))
 
+(defun pgsql-test--run-due-timers ()
+  "Run timers that are already due, such as asynchronous callbacks."
+  (accept-process-output nil 0.01))
+
 (ert-deftest pgsql-test-framing-supports-fragmentation-and-coalescing ()
   "Frames should be independent of process-filter chunk boundaries."
   (pgsql-test--with-connection connection
@@ -609,6 +613,140 @@ string encodes it with the preferred coding system instead."
         (should (= (length writes) 2))
         (should-not (pgsql-busy-p connection))
         (should-not (pgsql--connection-broken-p connection))))))
+
+(ert-deftest pgsql-test-async-request-finishes-once-at-ready-for-query ()
+  "An asynchronous request should finish once, after its ReadyForQuery."
+  (pgsql-test--with-connection connection
+    (let* ((columns (concat (pgsql-test--uint16 1)
+                            (pgsql-test--bytes "answer\0")
+                            (pgsql-test--uint32 0)
+                            (pgsql-test--uint16 0)
+                            (pgsql-test--uint32 23)
+                            (pgsql-test--uint16 4)
+                            (pgsql-test--uint32 #xffffffff)
+                            (pgsql-test--uint16 0)))
+           (transcript
+            (concat (pgsql-test--message ?T columns)
+                    (pgsql-test--message
+                     ?D (concat (pgsql-test--uint16 1)
+                                (pgsql-test--uint32 2)
+                                (pgsql-test--bytes "42")))
+                    (pgsql-test--message ?C (pgsql-test--bytes "SELECT 1\0"))
+                    (pgsql-test--message ?Z (unibyte-string ?T))))
+           writes calls)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'process-send-string)
+                 (lambda (_process bytes) (push bytes writes))))
+        (should-not
+         (pgsql-exec-async connection "SELECT 42"
+                           (lambda (result error)
+                             (push (list result error) calls))))
+        (should (equal writes
+                       (list (pgsql-test--message
+                              ?Q (pgsql-test--bytes "SELECT 42\0")))))
+        (dotimes (index (length transcript))
+          (should (pgsql-busy-p connection))
+          (pgsql--receive connection (substring transcript index (1+ index))))
+        (should-not (pgsql-busy-p connection))
+        (should-not calls)
+        (pgsql-test--run-due-timers)
+        (pgsql-test--run-due-timers)
+        (should (= (length calls) 1))
+        (pcase-let ((`(,result ,error) (car calls)))
+          (should-not error)
+          (should (equal (pgsql-result-rows result) '((42))))
+          (should (equal (pgsql-result-command-tag result) "SELECT 1")))
+        (should (eq (pgsql-transaction-status connection) 'in-transaction))))))
+
+(ert-deftest pgsql-test-async-server-error-keeps-connection-reusable ()
+  "A server error should reach the callback once the response is synchronized."
+  (pgsql-test--with-connection connection
+    (let ((transcript
+           (concat (pgsql-test--message
+                    ?E (pgsql-test--bytes
+                        (concat "SERROR\0VERROR\0C57014\0"
+                                "Mcanceling statement due to user request\0\0")))
+                   (pgsql-test--message ?Z (unibyte-string ?I))
+                   (pgsql-test--message ?C (pgsql-test--bytes "SELECT 1\0"))
+                   (pgsql-test--message ?Z (unibyte-string ?I))))
+          calls)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'process-send-string) #'ignore))
+        (pgsql-exec-async connection "SELECT pg_sleep(5)"
+                          (lambda (result error)
+                            (push (list result error) calls)))
+        (pgsql--receive connection transcript)
+        (pgsql-test--run-due-timers)
+        (should (= (length calls) 1))
+        (pcase-let ((`(,result ,error) (car calls)))
+          (should-not result)
+          (should (eq (car error) 'pgsql-server-error))
+          (should (equal (plist-get (pgsql-error-fields error) :sqlstate)
+                         "57014")))
+        (should-not (pgsql-busy-p connection))
+        (should-not (pgsql--connection-broken-p connection))
+        ;; The request stopped at its own ReadyForQuery.
+        (should (equal (pgsql-result-command-tag
+                        (pgsql-exec connection "SELECT 1"))
+                       "SELECT 1"))))))
+
+(ert-deftest pgsql-test-async-request-refuses-overlapping-requests ()
+  "A pending asynchronous request should refuse later requests unsent."
+  (pgsql-test--with-connection connection
+    (let ((parameters (list (cons [5 7] "_int4")))
+          writes)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'process-send-string)
+                 (lambda (_process bytes) (push bytes writes))))
+        (pgsql-exec-params-async connection "SELECT $1" parameters #'ignore)
+        (should (equal writes
+                       (list (pgsql--extended-query "SELECT $1" parameters))))
+        (should-error (pgsql-exec connection "SELECT 1")
+                      :type 'pgsql-connection-error)
+        (should-error (pgsql-exec-async connection "SELECT 1" #'ignore)
+                      :type 'pgsql-connection-error)
+        (should (= (length writes) 1))
+        (should (pgsql-busy-p connection))))))
+
+(ert-deftest pgsql-test-async-request-without-ready-closes-connection-once ()
+  "Losing synchronization should finish a pending request once and close it."
+  (pcase-dolist
+      (`(,label ,lose ,condition)
+       (list
+        (list "peer closed"
+              (lambda (connection)
+                (cl-letf (((symbol-function 'process-status)
+                           (lambda (_process) 'closed)))
+                  (pgsql--process-sentinel
+                   connection (pgsql--connection-process connection)
+                   "connection broken by remote peer\n")))
+              'pgsql-connection-error)
+        (list "caller disconnected" #'pgsql-disconnect 'pgsql-connection-error)
+        (list "malformed response"
+              (lambda (connection)
+                (pgsql--receive
+                 connection (pgsql-test--message ?D (pgsql-test--uint16 0))))
+              'pgsql-protocol-error)))
+    (ert-info (label)
+      (pgsql-test--with-connection connection
+        (let (calls)
+          (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                    ((symbol-function 'process-send-string) #'ignore)
+                    ((symbol-function 'delete-process) #'ignore))
+            (pgsql-exec-async connection "SELECT 1"
+                              (lambda (result error)
+                                (push (list result error) calls)))
+            (funcall lose connection)
+            (pgsql-disconnect connection)
+            (pgsql-test--run-due-timers)
+            (should (= (length calls) 1))
+            (pcase-let ((`(,result ,error) (car calls)))
+              (should-not result)
+              (should (eq (car error) condition)))
+            (should (pgsql--connection-broken-p connection))
+            (should-not (pgsql-busy-p connection))
+            (should-not
+             (buffer-live-p (pgsql--connection-input-buffer connection)))))))))
 
 (ert-deftest pgsql-test-unsynchronized-exit-breaks-connection ()
   "A request that exits before ReadyForQuery should mark the connection broken.
