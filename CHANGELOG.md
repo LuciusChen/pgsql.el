@@ -8,6 +8,7 @@ Notable user-visible changes are recorded here.
 
 - MD5 and SCRAM-SHA-256 authentication with a non-ASCII password or user name failed whenever Emacs preferred a coding system other than UTF-8: the credentials were hashed in that coding system instead of as the UTF-8 bytes sent to the server.
 - `pgsql-exec-params` could close the connection when the SQL or a parameter was a pure-ASCII multibyte string, such as text taken from a buffer: a type OID or parameter length with a byte of 0x80 or more (numeric, timestamptz, uuid, jsonb and array parameters, or a 200-byte text value) made the Parse or Bind length one byte too long, and PostgreSQL rejected it with `invalid message format`.
+- A read timeout in `pgsql-exec` or `pgsql-exec-params` closed the connection without cancelling the statement, which kept running on the server and could commit after the caller saw the timeout. The timeout now cancels the statement and drains its response, as a keyboard quit does, and leaves the connection usable; if that recovery fails, the connection is closed as before.
 
 ## 0.1.0 - 2026-08-17
 
