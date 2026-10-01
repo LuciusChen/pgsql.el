@@ -22,6 +22,7 @@ The initial supported surface is intentionally focused:
 - core scalar and array codecs needed by real callers
 - transaction state from `ReadyForQuery`
 - query timeout and PostgreSQL cancellation
+- asynchronous single-request execution through `pgsql-exec-async` and `pgsql-exec-params-async`
 
 Connection pooling, pipelining, automatic SQL retry or replay, ORM behavior, migrations, replication, logical decoding, COPY streaming, and idle LISTEN/NOTIFY polling or dispatch are out of scope until a concrete caller and tests justify them.
 
@@ -41,6 +42,7 @@ Connection pooling, pipelining, automatic SQL retry or replay, ORM behavior, mig
 - A process-filter chunk is not a message boundary. The parser must support arbitrary fragmentation and multiple coalesced messages.
 - Validate message type, length, and payload boundaries before consuming a frame. Reject malformed or unreasonably large frames as protocol errors.
 - A request completes only after its matching `ReadyForQuery` is consumed.
+- An asynchronous request completes exactly once, after its `ReadyForQuery` is consumed or its connection closes. Busy state is cleared before the callback is scheduled, and the callback runs from a timer, never inside the process filter. A send cut short, including by a quit, closes the connection without calling back.
 - After `ErrorResponse`, continue reading through `ReadyForQuery` before signaling the caller. If synchronization cannot be proven, mark the connection broken and close it.
 - Keep process lifecycle, request/busy state, and server transaction state separate. `ReadyForQuery` values `I`, `T`, and `E` are the authority for transaction state.
 - Never clear the receive buffer to conceal a parse failure or protocol misalignment.
