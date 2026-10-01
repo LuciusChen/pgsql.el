@@ -8,7 +8,7 @@ Read this file before changing code, tests, or documentation. This repository co
 - It does not own a query console, result grid, completion, schema browser, connection prompts, saved connections, SQL rewriting, JDBC routing, or any other caller UI.
 - Do not depend on Clutch or add caller-specific branches. Callers load `(require 'pgsql)` and use documented public `pgsql-` APIs.
 - Do not call private APIs from another package. If a required capability is unavailable publicly, expose or implement it at the owning boundary.
-- Keep the first usable release in one implementation file, `pgsql.el`. Split only when a stable responsibility can move whole and the split reduces total complexity. Do not create `wire`, `auth`, `codec`, `common`, or `utils` modules merely to shorten the main file.
+- The package ships `pgsql.el` and `pgsql-saslprep.el`, which holds the SASLprep tables derived from PostgreSQL. Split further only when a stable responsibility can move whole and the split reduces total complexity. Do not create `wire`, `auth`, `codec`, `common`, or `utils` modules merely to shorten the main file.
 
 ## Initial Scope
 
@@ -30,7 +30,7 @@ Connection pooling, pipelining, automatic SQL retry or replay, ORM behavior, mig
 - Prefer the simplest model that is correct. Add abstractions only when they remove duplication, protect a real boundary, or simplify callers.
 - Reduce code through clearer state, ownership, and control flow. Moving code or adding wrappers is not an architectural improvement by itself.
 - Treat piles of tiny helpers, one-use wrappers, and pass-through accessors as design debt. Inline trivial helpers or fix the missing ownership boundary.
-- Delete unused code rather than adding compatibility shims before the package has a released compatibility contract.
+- Delete unused private code rather than keeping compatibility shims. Public `pgsql-` symbols have been a released contract since 0.1.0: remove or rename one only with a `CHANGELOG.md` entry, and release that change as a new minor version.
 - Find the failing layer before changing behavior. Do not stack speculative fallbacks around a protocol or lifecycle bug.
 - One failed fix should narrow the hypothesis. After two failed fixes on the same issue, stop patching and return to diagnosis.
 - Keep experiments narrow. Do not expand the supported protocol surface until the smallest end-to-end slice works and is tested.
@@ -81,7 +81,8 @@ Connection pooling, pipelining, automatic SQL retry or replay, ORM behavior, mig
 
 - Keep `README.org` aligned with implemented behavior. Code is the source of truth when drift is found.
 - Update `CHANGELOG.md` in the same change for public API, compatibility, behavior, or protocol-support changes. Pure test or internal cleanup need not add release noise.
-- Keep the next version under an `Unreleased` heading until a release is intentionally cut and tagged.
+- Keep the next version under an `Unreleased` heading until a release is intentionally cut and tagged. Only a release changes `;; Version:` in `pgsql.el`.
+- pgsql.el is released: 0.1.0 is tagged `v0.1.0`, and MELPA builds the package from `main`, so every merge reaches MELPA users.
 - Keep one source paragraph on one line. Do not rewrap prose merely to fit a source-width limit; improve headings, paragraphs, and wording instead.
 - Treat released artifacts as immutable. Changed release bytes require a new version and matching metadata.
 
@@ -99,6 +100,8 @@ For protocol execution, authentication, cancellation, TLS, or lifecycle changes,
 ```bash
 ./test/run-ci.sh live
 ```
+
+`live` skips every test unless `PGSQL_TEST_HOST`, `PGSQL_TEST_PORT`, `PGSQL_TEST_USER`, `PGSQL_TEST_PASSWORD` and `PGSQL_TEST_DATABASE` are set, and its user needs `CREATEROLE` (see Development in `README.org`). Count it only when the ERT summary shows that tests ran.
 
 For TLS negotiation or certificate-verification changes, also run the self-contained real-TLS suite:
 
