@@ -748,6 +748,28 @@ string encodes it with the preferred coding system instead."
             (should-not
              (buffer-live-p (pgsql--connection-input-buffer connection)))))))))
 
+(ert-deftest pgsql-test-async-request-cut-short-while-sending-closes-connection ()
+  "A send that fails or is quit should close the connection without a callback."
+  (pcase-dolist (`(,label ,condition ,signaled)
+                 '(("send error" (file-error "Broken pipe") pgsql-connection-error)
+                   ("quit" (quit) quit)))
+    (ert-info (label)
+      (pgsql-test--with-connection connection
+        (let (calls caught)
+          (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                    ((symbol-function 'process-send-string)
+                     (lambda (_process _bytes) (signal (car condition) (cdr condition))))
+                    ((symbol-function 'delete-process) #'ignore))
+            (condition-case err
+                (pgsql-exec-async connection "SELECT 1"
+                                  (lambda (&rest outcome) (push outcome calls)))
+              ((error quit) (setq caught (car err))))
+            (pgsql-test--run-due-timers)
+            (should (eq caught signaled))
+            (should-not calls)
+            (should (pgsql--connection-broken-p connection))
+            (should-not (pgsql-busy-p connection))))))))
+
 (ert-deftest pgsql-test-unsynchronized-exit-breaks-connection ()
   "A request that exits before ReadyForQuery should mark the connection broken.
 This must hold, and write nothing beyond the original request, whether

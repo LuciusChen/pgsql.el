@@ -1425,14 +1425,20 @@ CALLBACK is called as described in `pgsql-exec-async'."
   (setf (pgsql--connection-busy-p connection) t
         (pgsql--connection-pending connection)
         (pgsql--make-response :callback callback))
-  (condition-case err
-      (pgsql--send connection bytes)
-    (error
-     (setf (pgsql--connection-pending connection) nil)
-     (pgsql--mark-broken connection)
-     (signal 'pgsql-connection-error
-             (list (format "PostgreSQL request failed: %s"
-                           (error-message-string err))))))
+  (let (sent)
+    (unwind-protect
+        (condition-case err
+            (progn
+              (pgsql--send connection bytes)
+              (setq sent t))
+          (error
+           (signal 'pgsql-connection-error
+                   (list (format "PostgreSQL request failed: %s"
+                                 (error-message-string err))))))
+      ;; A request cut short, even by a quit, may be partly sent.
+      (unless sent
+        (setf (pgsql--connection-pending connection) nil)
+        (pgsql--mark-broken connection))))
   nil)
 
 (defun pgsql--advance-async (connection)
@@ -1640,9 +1646,9 @@ RESULT is nil and ERROR is an error condition: after a
 any other condition CONNECTION is closed.  CONNECTION stays busy until
 the callback is scheduled, so it is idle when CALLBACK runs.
 `pgsql-cancel' asks the server to stop the command, which then completes
-with the server's verdict.  The read timeout does not apply.  When the
-request cannot be sent, signal at once without calling CALLBACK;
-CONNECTION is then closed."
+with the server's verdict.  The read timeout does not apply.  When
+sending the request fails or is quit, signal at once without calling
+CALLBACK; CONNECTION is then closed."
   (pgsql--request-async
    connection (pgsql--message ?Q (pgsql--cstring sql)) callback))
 
