@@ -425,11 +425,11 @@ Progress receiving a fragmented message restarts the timeout."
              (not (pgsql--connection-closing-p connection))
              (memq (process-status process) '(closed failed exit signal)))
     (setf (pgsql--connection-broken-p connection) t)
-    (if-let* ((response (pgsql--connection-pending connection)))
+    (if (pgsql--connection-pending connection)
         ;; The filter has already consumed every delivered message, and no
         ;; caller waits on an asynchronous request, so finish it here.
         (pgsql--finish-async
-         connection response nil
+         connection nil
          '(pgsql-connection-error "PostgreSQL connection closed while reading"))
       ;; An active request owns cleanup so it may first consume bytes already
       ;; delivered by the process filter.  With no request, nothing can consume
@@ -1452,22 +1452,22 @@ CALLBACK is called as described in `pgsql-exec-async'."
                       (setq message (pgsql--take-message connection)))
             (setq outcome (pgsql--response-step connection response message)))
           (when outcome
-            (pgsql--finish-async connection response outcome nil)))
+            (pgsql--finish-async connection outcome nil)))
       (pgsql-error
-       (pgsql--finish-async connection response nil err))
+       (pgsql--finish-async connection nil err))
       (error
        (pgsql--finish-async
-        connection response nil
+        connection nil
         (list 'pgsql-connection-error
               (format "PostgreSQL request failed: %s"
                       (error-message-string err))))))))
 
-(defun pgsql--finish-async (connection response outcome error)
-  "Finish CONNECTION's pending RESPONSE once, from OUTCOME or ERROR.
+(defun pgsql--finish-async (connection outcome error)
+  "Finish CONNECTION's pending request, if any, from OUTCOME or ERROR.
 OUTCOME is a synchronized cons of result and server error fields.
 ERROR is a condition after which CONNECTION cannot be synchronized, so
 it is closed.  The callback runs from a timer, outside the filter."
-  (when (eq response (pgsql--connection-pending connection))
+  (when-let* ((response (pgsql--connection-pending connection)))
     (setf (pgsql--connection-pending connection) nil)
     (if error
         (pgsql--mark-broken connection)
@@ -1609,9 +1609,9 @@ This timeout bounds future cancellation connections.  Zero disables it."
   "Close CONNECTION and release its process and input buffer.
 A pending asynchronous request completes with a connection error."
   (when (pgsql-connection-p connection)
-    (if-let* ((response (pgsql--connection-pending connection)))
+    (if (pgsql--connection-pending connection)
         ;; Finishing with an error closes CONNECTION through this function.
-        (pgsql--finish-async connection response nil
+        (pgsql--finish-async connection nil
                              '(pgsql-connection-error
                                "PostgreSQL connection closed"))
       (setf (pgsql--connection-closing-p connection) t)
