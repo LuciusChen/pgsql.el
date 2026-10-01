@@ -48,6 +48,7 @@ run_checkdoc() {
     cd "$repo"
     run_emacs \
       --eval "(require 'checkdoc)" \
+      --eval "(setq checkdoc-verb-check-experimental-flag t)" \
       --eval "(checkdoc-file \"pgsql-saslprep.el\")" \
       --eval "(checkdoc-file \"pgsql.el\")" \
       --eval "(dolist (name '(\"*Warnings*\" \"*warn*\")) (when-let* ((buffer (get-buffer name))) (with-current-buffer buffer (goto-char (point-min)) (when (re-search-forward \"^Warning\" nil t) (princ (buffer-string)) (kill-emacs 1)))))"
