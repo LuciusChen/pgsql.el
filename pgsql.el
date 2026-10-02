@@ -5,7 +5,7 @@
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; Maintainer: Lucius Chen <chenyh572@gmail.com>
 ;; Assisted-by: OpenAI Codex:gpt-5.5
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, data
 ;; URL: https://github.com/LuciusChen/pgsql.el
