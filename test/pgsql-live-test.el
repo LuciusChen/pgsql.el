@@ -337,6 +337,25 @@ Skip the current test when required live-test configuration is absent."
         (when timer
           (cancel-timer timer))))))
 
+(ert-deftest pgsql-live-test-read-timeout-cancels-the-statement ()
+  :tags '(:live)
+  "A read timeout should cancel the statement and keep the session usable."
+  (pgsql-live-test--with-connection connection
+    (pgsql-exec connection "CREATE TEMPORARY TABLE pgsql_timeout_probe (n int4)")
+    (pgsql-exec connection "INSERT INTO pgsql_timeout_probe VALUES (0)")
+    (pgsql-set-read-timeout connection 1)
+    (should-error
+     (pgsql-exec connection
+                 "UPDATE pgsql_timeout_probe SET n = n + 1 WHERE pg_sleep(3) IS NOT NULL")
+     :type 'pgsql-timeout)
+    (should-not (pgsql-busy-p connection))
+    (should (eq (pgsql-transaction-status connection) 'idle))
+    ;; Closing the connection instead would have let the update commit.
+    (should (equal (pgsql-result-rows
+                    (pgsql-exec connection "SELECT n FROM pgsql_timeout_probe"))
+                   '((0))))
+    (should (pgsql-live-p connection))))
+
 (ert-deftest pgsql-live-test-keyboard-quit-cancels-and-keeps-session-reusable ()
   :tags '(:live)
   "A real keyboard quit should drain cancellation before returning control."

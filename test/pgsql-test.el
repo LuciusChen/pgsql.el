@@ -868,79 +868,83 @@ the collector signals a protocol error or performs a nonlocal exit."
       (when connection
         (pgsql-disconnect connection)))))
 
-(ert-deftest pgsql-test-quit-cancels-drains-and-keeps-session-reusable ()
-  "A quit should cancel and synchronize before it leaves the request."
-  (pgsql-test--with-connection connection
-    (setf (pgsql--connection-connect-timeout connection) 0
-          (pgsql--connection-read-timeout connection) 300)
-    (let ((pgsql--cancel-recovery-timeout 0.25)
-          (collect-count 0)
-          (cancel-count 0)
-          cancel-deadline
-          recovery-deadline
-          caught)
-      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
-                ((symbol-function 'process-send-string) #'ignore)
-                ((symbol-function 'pgsql--cancel-with-deadline)
-                 (lambda (actual deadline)
-                   (should (eq actual connection))
-                   (setq cancel-deadline deadline)
-                   (cl-incf cancel-count)
-                   t))
-                ((symbol-function 'pgsql--collect-result)
-                 (lambda (_connection &optional deadline)
-                   (pcase (cl-incf collect-count)
-                     (1
-                      (should-not deadline)
-                      (signal 'quit nil))
-                     (2
-                      (setq recovery-deadline deadline)
-                      (cons (pgsql--make-result) '(:sqlstate "57014")))
-                     (_
-                      (should-not deadline)
-                      (cons (pgsql--make-result :command-tag "SELECT 1")
-                            nil))))))
-        (condition-case nil
-            (pgsql-exec connection "SELECT pg_sleep(5)")
-          (quit (setq caught t)))
-        (should caught)
-        (should (= cancel-count 1))
-        (should cancel-deadline)
-        (should recovery-deadline)
-        (should (= cancel-deadline recovery-deadline))
-        (should (= (pgsql--connection-connect-timeout connection) 0))
-        (should (= (pgsql--connection-read-timeout connection) 300))
-        (should-not (pgsql-busy-p connection))
-        (should-not (pgsql--connection-broken-p connection))
-        (should (buffer-live-p (pgsql--connection-input-buffer connection)))
-        (should (equal (pgsql-result-command-tag
-                        (pgsql-exec connection "SELECT 1"))
-                       "SELECT 1"))))))
+(ert-deftest pgsql-test-interrupted-read-cancels-drains-and-keeps-session-reusable ()
+  "A quit or read timeout should cancel and synchronize before it leaves the request."
+  (dolist (interruption '((quit) (pgsql-timeout "PostgreSQL response timed out")))
+    (ert-info ((format "interruption: %s" (car interruption)))
+      (pgsql-test--with-connection connection
+        (setf (pgsql--connection-connect-timeout connection) 0
+              (pgsql--connection-read-timeout connection) 300)
+        (let ((pgsql--cancel-recovery-timeout 0.25)
+              (collect-count 0)
+              (cancel-count 0)
+              cancel-deadline
+              recovery-deadline
+              caught)
+          (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                    ((symbol-function 'process-send-string) #'ignore)
+                    ((symbol-function 'pgsql--cancel-with-deadline)
+                     (lambda (actual deadline)
+                       (should (eq actual connection))
+                       (setq cancel-deadline deadline)
+                       (cl-incf cancel-count)
+                       t))
+                    ((symbol-function 'pgsql--collect-result)
+                     (lambda (_connection &optional deadline)
+                       (pcase (cl-incf collect-count)
+                         (1
+                          (should-not deadline)
+                          (signal (car interruption) (cdr interruption)))
+                         (2
+                          (setq recovery-deadline deadline)
+                          (cons (pgsql--make-result) '(:sqlstate "57014")))
+                         (_
+                          (should-not deadline)
+                          (cons (pgsql--make-result :command-tag "SELECT 1")
+                                nil))))))
+            (condition-case err
+                (pgsql-exec connection "SELECT pg_sleep(5)")
+              ((quit pgsql-timeout) (setq caught (car err))))
+            (should (eq caught (car interruption)))
+            (should (= cancel-count 1))
+            (should cancel-deadline)
+            (should recovery-deadline)
+            (should (= cancel-deadline recovery-deadline))
+            (should (= (pgsql--connection-connect-timeout connection) 0))
+            (should (= (pgsql--connection-read-timeout connection) 300))
+            (should-not (pgsql-busy-p connection))
+            (should-not (pgsql--connection-broken-p connection))
+            (should (buffer-live-p (pgsql--connection-input-buffer connection)))
+            (should (equal (pgsql-result-command-tag
+                            (pgsql-exec connection "SELECT 1"))
+                           "SELECT 1"))))))))
 
-(ert-deftest pgsql-test-quit-recovery-failure-closes-the-session ()
-  "A failed bounded quit recovery should close uncertain protocol state."
-  (pgsql-test--with-connection connection
-    (setf (pgsql--connection-connect-timeout connection) 42)
-    (let (caught)
-      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
-                ((symbol-function 'process-send-string) #'ignore)
-                ((symbol-function 'delete-process) #'ignore)
-                ((symbol-function 'pgsql--cancel-with-deadline)
-                 (lambda (_connection _deadline)
-                   (signal 'pgsql-timeout '("cancel timed out"))))
-                ((symbol-function 'pgsql--collect-result)
-                 (lambda (_connection &optional _deadline)
-                   (signal 'quit nil))))
-        (condition-case nil
-            (pgsql-exec connection "SELECT pg_sleep(5)")
-          (quit (setq caught t))))
-      (should caught)
-      (should (= (pgsql--connection-connect-timeout connection) 42))
-      (should (pgsql--connection-broken-p connection))
-      (should (pgsql--connection-closing-p connection))
-      (should-not (pgsql-busy-p connection))
-      (should-not (buffer-live-p
-                   (pgsql--connection-input-buffer connection))))))
+(ert-deftest pgsql-test-interrupted-read-recovery-failure-closes-the-session ()
+  "A failed bounded recovery after a quit or read timeout should close the session."
+  (dolist (interruption '((quit) (pgsql-timeout "PostgreSQL response timed out")))
+    (ert-info ((format "interruption: %s" (car interruption)))
+      (pgsql-test--with-connection connection
+        (setf (pgsql--connection-connect-timeout connection) 42)
+        (let (caught)
+          (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                    ((symbol-function 'process-send-string) #'ignore)
+                    ((symbol-function 'delete-process) #'ignore)
+                    ((symbol-function 'pgsql--cancel-with-deadline)
+                     (lambda (_connection _deadline)
+                       (signal 'pgsql-timeout '("cancel timed out"))))
+                    ((symbol-function 'pgsql--collect-result)
+                     (lambda (_connection &optional _deadline)
+                       (signal (car interruption) (cdr interruption)))))
+            (condition-case err
+                (pgsql-exec connection "SELECT pg_sleep(5)")
+              ((quit pgsql-timeout) (setq caught (car err)))))
+          (should (eq caught (car interruption)))
+          (should (= (pgsql--connection-connect-timeout connection) 42))
+          (should (pgsql--connection-broken-p connection))
+          (should (pgsql--connection-closing-p connection))
+          (should-not (pgsql-busy-p connection))
+          (should-not (buffer-live-p
+                       (pgsql--connection-input-buffer connection))))))))
 
 (ert-deftest pgsql-test-connect-wraps-raw-transport-errors ()
   "Generic network errors should cross the public boundary as pgsql errors."

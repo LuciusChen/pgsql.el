@@ -1401,12 +1401,14 @@ Return non-nil only when the connection is synchronized again."
               (if (cdr response)
                   (pgsql--signal-server-error (cdr response))
                 (car response)))
-          (pgsql-error
-           (signal (car err) (cdr err)))
-          (quit
+          ;; The statement may still be running: cancel it and drain its
+          ;; response, so it cannot commit after the caller gave up.
+          ((quit pgsql-timeout)
            (when (or (not sent)
                      (pgsql--cancel-and-drain connection))
              (setq synchronized t))
+           (signal (car err) (cdr err)))
+          (pgsql-error
            (signal (car err) (cdr err)))
           (error
            (signal 'pgsql-connection-error
