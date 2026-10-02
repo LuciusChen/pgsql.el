@@ -4,6 +4,10 @@ Notable user-visible changes are recorded here.
 
 ## Unreleased
 
+### Added
+
+- `pgsql-exec-async` and `pgsql-exec-params-async` send a query without waiting. The process filter reads the response as it arrives and the callback runs once with the result or an error condition. The connection stays busy until the callback is scheduled, and `pgsql-cancel` ends the command with the server's verdict.
+
 ### Fixed
 
 - MD5 and SCRAM-SHA-256 authentication with a non-ASCII password or user name failed whenever Emacs preferred a coding system other than UTF-8: the credentials were hashed in that coding system instead of as the UTF-8 bytes sent to the server.

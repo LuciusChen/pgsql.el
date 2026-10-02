@@ -26,7 +26,7 @@ The package is protocol-only. Query consoles, result rendering, completion, sche
 
 MELPA already provides [[https://github.com/emarsden/pg-el][pg.el]], a mature and broad PostgreSQL client with COPY support, asynchronous idle LISTEN/NOTIFY handling, Unix-domain sockets, extensible type decoding, and a large server-compatibility matrix. =pgsql.el= is not a fork or drop-in replacement and does not try to match that feature breadth; applications that need those capabilities should use pg.el.
 
-=pgsql.el= provides a narrower protocol-library boundary for synchronous application clients: no third-party runtime dependency, opaque connection and result values, one request in flight, completion only after the matching =ReadyForQuery= has been consumed, authoritative public transaction state, a dedicated SQL NULL value distinct from PostgreSQL false, and bounded cancellation that drains the original connection before reuse. Those lifecycle guarantees let callers such as Clutch depend on public protocol state without reaching into transport internals or maintaining caller-side synchronization workarounds.
+=pgsql.el= provides a narrower protocol-library boundary for application clients: no third-party runtime dependency, opaque connection and result values, one request in flight, completion only after the matching =ReadyForQuery= has been consumed, authoritative public transaction state, a dedicated SQL NULL value distinct from PostgreSQL false, and bounded cancellation that drains the original connection before reuse. Those lifecycle guarantees let callers such as Clutch depend on public protocol state without reaching into transport internals or maintaining caller-side synchronization workarounds.
 
 * Requirements
 
@@ -90,11 +90,22 @@ Recognized built-in type names are sent as Parse OIDs. Unknown, extension, and d
 
 Both query functions consume the complete response through =ReadyForQuery= before returning or signaling. =pgsql-transaction-status= reports =idle=, =in-transaction=, or =failed-transaction= from that server message. A structured =pgsql-server-error= retains fields such as =:sqlstate=, =:detail=, and =:constraint= through =pgsql-error-fields=, and the same connection remains reusable after a synchronized server error.
 
-=NotificationResponse= messages encountered while reading a response are delivered through =pgsql-notification-functions= with the connection and a plist containing =:pid=, =:channel=, and =:payload=. The synchronous client does not poll or dispatch messages while a connection is idle.
+=NotificationResponse= messages encountered while reading a response are delivered through =pgsql-notification-functions= with the connection and a plist containing =:pid=, =:channel=, and =:payload=. =pgsql.el= does not poll or dispatch messages while a connection is idle.
 
 Results expose =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, and =pgsql-result-affected-rows=. Column metadata is read through =pgsql-column-name=, =pgsql-column-type-oid=, and =pgsql-column-type-name=. Core scalar and array values are decoded from PostgreSQL text format; binary result columns are rejected explicitly rather than guessed. Unknown types remain UTF-8 strings with their OID preserved in the column metadata. Arbitrary-precision =numeric= and wall-clock =date=/=timestamp= values remain exact text, while =timestamptz= becomes an Emacs time value. =bytea= parameters and results use unibyte strings and accept either PostgreSQL hex or escape output.
 
 =pgsql-cancel= sends PostgreSQL's CancelRequest over a separate short-lived connection. The original query path still consumes the cancellation error and its final =ReadyForQuery= before it becomes reusable. A keyboard quit during =pgsql-exec= or =pgsql-exec-params= performs this cancellation and drain internally before re-signaling =quit=; if synchronization fails, the connection is closed instead of being returned in an unknown state.
+
+=pgsql-exec-async= and =pgsql-exec-params-async= send the same requests without waiting and return =nil=. The process filter reads the response as it arrives, and the callback then runs once, from a timer, with the result and =nil=, or with =nil= and an error condition: after a =pgsql-server-error= the connection is synchronized and reusable, and after any other condition it is closed. The connection stays busy until the callback is scheduled, so other requests on it are refused. The read timeout does not apply; =pgsql-cancel= asks the server to stop the command, which then completes with the server's verdict.
+
+#+begin_src emacs-lisp
+(pgsql-exec-async
+ connection "SELECT count(*) FROM big_table"
+ (lambda (result error)
+   (if error
+       (message "Failed: %s" (error-message-string error))
+     (message "Rows: %S" (pgsql-result-rows result)))))
+#+end_src
 
 * Public API
 
@@ -103,7 +114,7 @@ Connections and results are opaque values. Callers use the public symbols below 
 - Connection lifecycle: =pgsql-connect=, =pgsql-disconnect=, and =pgsql-connection-p=. =pgsql-connect= accepts =:database=, =:user=, =:password=, =:host=, =:port=, =:sslmode=, =:connect-timeout=, =:read-timeout=, and =:application-name=.
 - Connection defaults and bounds: =pgsql-connect-timeout=, =pgsql-read-timeout=, =pgsql-sslmode=, =pgsql-application-name=, and =pgsql-max-message-bytes=. =pgsql-set-connect-timeout= and =pgsql-set-read-timeout= change the corresponding bounds on an existing connection.
 - Connection state and metadata: =pgsql-live-p=, =pgsql-busy-p=, =pgsql-transaction-status=, =pgsql-parameter=, =pgsql-user=, =pgsql-host=, =pgsql-port=, and =pgsql-database=.
-- Execution and cancellation: =pgsql-exec=, =pgsql-exec-params=, and =pgsql-cancel=.
+- Execution and cancellation: =pgsql-exec=, =pgsql-exec-params=, =pgsql-exec-async=, =pgsql-exec-params-async=, and =pgsql-cancel=.
 - Results: =pgsql-result-p=, =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, and =pgsql-result-affected-rows=.
 - Column and type metadata: =pgsql-column-name=, =pgsql-column-type-oid=, =pgsql-column-type-name=, and =pgsql-type-name=.
 - Values and SQL quoting: =pgsql-null= and =pgsql-null-p= distinguish SQL NULL; =pgsql-array-literal= encodes typed arrays; =pgsql-escape-identifier= and =pgsql-escape-literal= quote SQL identifiers and string literals.
