@@ -472,8 +472,8 @@ The connection stays reusable after the cancelled COPY."
 (ert-deftest pgsql-live-test-copy-out-function-may-wait ()
   :tags '(:live)
   "A COPY function that waits for output should get every row once, in order.
-Waiting on its first batch lets the rest of the COPY, and its end, arrive
-meanwhile; the callback still follows the function's last call."
+It waits on its first batch until the COPY has ended; the callback still
+follows the function's last call."
   (pgsql-live-test--with-connection connection
     (let ((depth 0) (deepest 0) (next 1) (count 0) outcome)
       (pgsql-copy-out-async
@@ -484,7 +484,12 @@ meanwhile; the callback still follows the function's last call."
          (unwind-protect
              (progn
                (when (= next 1)
-                 (accept-process-output nil 0.5))
+                 ;; Wait until the COPY has ended, as a slow write might,
+                 ;; and let its completion run meanwhile.
+                 (with-timeout (10 (ert-fail "The COPY did not end"))
+                   (while (pgsql-busy-p connection)
+                     (accept-process-output nil 0.05)))
+                 (accept-process-output nil 0.05))
                (dolist (row batch)
                  (setq count (1+ count))
                  (when (equal row (format "%d\n" next))
