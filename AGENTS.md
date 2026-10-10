@@ -23,8 +23,9 @@ The initial supported surface is intentionally focused:
 - transaction state from `ReadyForQuery`
 - query timeout and PostgreSQL cancellation
 - asynchronous single-request execution through `pgsql-exec-async` and `pgsql-exec-params-async`
+- `COPY ... TO STDOUT` streaming through `pgsql-copy-out-async`
 
-Connection pooling, pipelining, automatic SQL retry or replay, ORM behavior, migrations, replication, logical decoding, COPY streaming, and idle LISTEN/NOTIFY polling or dispatch are out of scope until a concrete caller and tests justify them.
+Connection pooling, pipelining, automatic SQL retry or replay, ORM behavior, migrations, replication, logical decoding, `COPY FROM STDIN`, and idle LISTEN/NOTIFY polling or dispatch are out of scope until a concrete caller and tests justify them.
 
 ## Core Engineering
 

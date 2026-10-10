@@ -690,6 +690,134 @@ string encodes it with the preferred coding system instead."
                         (pgsql-exec connection "SELECT 1"))
                        "SELECT 1"))))))
 
+(defun pgsql-test--copy-out-response (columns)
+  "Return a text-format CopyOutResponse for COLUMNS columns."
+  (pgsql-test--message
+   ?H (apply #'concat (unibyte-string 0) (pgsql-test--uint16 columns)
+             (make-list columns (pgsql-test--uint16 0)))))
+
+(ert-deftest pgsql-test-copy-out-passes-rows-in-order-before-the-callback ()
+  "COPY TO STDOUT rows should reach FUNCTION whole, in order, before CALLBACK.
+FUNCTION runs from timers, never inside the process filter, and rows still
+queued when the COPY completes reach it before CALLBACK, whichever timer
+runs first.  Rows are independent of process-filter chunks, a notice
+between them is handled, and the connection is reusable after the COPY."
+  (pgsql-test--with-connection connection
+    (let* ((first (concat (pgsql-test--copy-out-response 2)
+                          (pgsql-test--message ?d (pgsql-test--bytes "1\tone\n"))))
+           (rest
+            (concat (pgsql-test--message
+                     ?N (pgsql-test--bytes "SNOTICE\0VNOTICE\0C00000\0Mnote\0\0"))
+                    (pgsql-test--message ?d (pgsql-test--bytes "2\ttwo\n"))
+                    (pgsql-test--message ?d (pgsql-test--bytes "3\t\\N\n"))
+                    (pgsql-test--message ?c "")
+                    (pgsql-test--message ?C (pgsql-test--bytes "COPY 3\0"))
+                    (pgsql-test--message ?Z (unibyte-string ?I))
+                    (pgsql-test--message ?C (pgsql-test--bytes "SELECT 1\0"))
+                    (pgsql-test--message ?Z (unibyte-string ?I))))
+           writes events scheduled)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'process-send-string)
+                 (lambda (_process bytes) (push bytes writes)))
+                ((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest arguments)
+                   (push (cons function arguments) scheduled))))
+        (should-not
+         (pgsql-copy-out-async connection "COPY t TO STDOUT"
+                               (lambda (rows) (push (cons 'rows rows) events))
+                               (lambda (result error)
+                                 (push (list 'done result error) events))))
+        (should (equal writes
+                       (list (pgsql-test--message
+                              ?Q (pgsql-test--bytes "COPY t TO STDOUT\0")))))
+        (dotimes (index (length first))
+          (pgsql--receive connection (substring first index (1+ index))))
+        (should-not events)
+        (apply #'funcall (pop scheduled))
+        (should (equal events (list (list 'rows (pgsql-test--bytes "1\tone\n")))))
+        (should (pgsql-busy-p connection))
+        (pgsql--receive connection rest)
+        (should-not (pgsql-busy-p connection))
+        (should (= (length events) 1))
+        ;; The completion was scheduled last; run it before the delivery.
+        (dolist (timer scheduled)
+          (apply #'funcall timer))
+        (pcase-let ((`(,_ ,second (done ,result ,error)) (reverse events)))
+          (should (equal second (list 'rows (pgsql-test--bytes "2\ttwo\n")
+                                      (pgsql-test--bytes "3\t\\N\n"))))
+          (should-not error)
+          (should (equal (pgsql-result-command-tag result) "COPY 3"))
+          (should (equal (pgsql-result-affected-rows result) 3)))
+        (should (= (length events) 3))
+        (should (equal (pgsql-result-command-tag
+                        (pgsql-exec connection "SELECT 1"))
+                       "SELECT 1"))))))
+
+(ert-deftest pgsql-test-copy-out-function-error-cancels-the-copy ()
+  "A failing FUNCTION should get no further rows and cancel the COPY.
+CALLBACK receives FUNCTION's condition once the response is synchronized,
+and the connection stays reusable."
+  (pgsql-test--with-connection connection
+    (let (batches calls cancels)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'process-send-string) #'ignore)
+                ((symbol-function 'pgsql-cancel)
+                 (lambda (connection) (push connection cancels) t)))
+        (pgsql-copy-out-async connection "COPY t TO STDOUT"
+                              (lambda (rows)
+                                (push rows batches)
+                                (error "Disk full"))
+                              (lambda (result error)
+                                (push (list result error) calls)))
+        (pgsql--receive connection
+                        (concat (pgsql-test--copy-out-response 1)
+                                (pgsql-test--message ?d (pgsql-test--bytes "1\n"))))
+        (pgsql-test--run-due-timers)
+        (should (equal batches (list (list (pgsql-test--bytes "1\n")))))
+        (should (equal cancels (list connection)))
+        (should-not calls)
+        (pgsql--receive
+         connection
+         (concat (pgsql-test--message ?d (pgsql-test--bytes "2\n"))
+                 (pgsql-test--message
+                  ?E (pgsql-test--bytes
+                      (concat "SERROR\0VERROR\0C57014\0"
+                              "Mcanceling statement due to user request\0\0")))
+                 (pgsql-test--message ?Z (unibyte-string ?I))))
+        (pgsql-test--run-due-timers)
+        (pgsql-test--run-due-timers)
+        (should (= (length batches) 1))
+        (should (equal calls '((nil (error "Disk full")))))
+        (should (= (length cancels) 1))
+        (should-not (pgsql-busy-p connection))
+        (should-not (pgsql--connection-broken-p connection))))))
+
+(ert-deftest pgsql-test-copy-out-rejects-malformed-copy-messages ()
+  "A malformed CopyOutResponse or CopyDone should close the connection."
+  (pcase-dolist
+      (`(,label ,bytes)
+       (list
+        (list "CopyOutResponse without its column formats"
+              (pgsql-test--message
+               ?H (concat (unibyte-string 0) (pgsql-test--uint16 1))))
+        (list "CopyDone with a payload"
+              (concat (pgsql-test--copy-out-response 0)
+                      (pgsql-test--message ?c (unibyte-string 0))))))
+    (ert-info (label)
+      (pgsql-test--with-connection connection
+        (let (calls)
+          (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                    ((symbol-function 'process-send-string) #'ignore)
+                    ((symbol-function 'delete-process) #'ignore))
+            (pgsql-copy-out-async connection "COPY t TO STDOUT" #'ignore
+                                  (lambda (result error)
+                                    (push (list result error) calls)))
+            (pgsql--receive connection bytes)
+            (pgsql-test--run-due-timers)
+            (should (= (length calls) 1))
+            (should (eq (car (cadr (car calls))) 'pgsql-protocol-error))
+            (should (pgsql--connection-broken-p connection))))))))
+
 (ert-deftest pgsql-test-async-request-refuses-overlapping-requests ()
   "A pending asynchronous request should refuse later requests unsent."
   (pgsql-test--with-connection connection
@@ -726,6 +854,13 @@ string encodes it with the preferred coding system instead."
               (lambda (connection)
                 (pgsql--receive
                  connection (pgsql-test--message ?D (pgsql-test--uint16 0))))
+              'pgsql-protocol-error)
+        (list "COPY outside pgsql-copy-out-async"
+              (lambda (connection)
+                (pgsql--receive
+                 connection
+                 (pgsql-test--message
+                  ?H (concat (unibyte-string 0) (pgsql-test--uint16 0)))))
               'pgsql-protocol-error)))
     (ert-info (label)
       (pgsql-test--with-connection connection
