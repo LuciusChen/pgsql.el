@@ -143,7 +143,11 @@ Zero means no timeout."
                (:constructor pgsql--make-response)
                (:copier nil))
   "Progress of one response read through ReadyForQuery.
-CALLBACK is set only for an asynchronous request."
+CALLBACK is set only for an asynchronous request, and COPY-FUNCTION only
+for `pgsql-copy-out-async'.  COPY-ROWS holds CopyData payloads not yet
+passed to it, newest first; COPY-PENDING is non-nil while their delivery
+is scheduled or running, and COPY-FINISH completes the request once that
+delivery returns; COPY-ERROR is the condition it signaled."
   columns
   rows
   final-columns
@@ -151,7 +155,12 @@ CALLBACK is set only for an asynchronous request."
   command-tag
   server-error
   terminal-seen
-  callback)
+  callback
+  copy-function
+  copy-rows
+  copy-pending
+  copy-finish
+  copy-error)
 
 (defun pgsql-connection-p (value)
   "Return non-nil when VALUE is a PostgreSQL connection."
@@ -1333,6 +1342,35 @@ ReadyForQuery ends RESPONSE, and nil before then."
            (setf (pgsql--response-server-error response)
                  (pgsql--error-fields payload)))
          (setf (pgsql--response-terminal-seen response) t))
+        (?H
+         (unless (pgsql--response-copy-function response)
+           (signal 'pgsql-protocol-error
+                   (list "PostgreSQL started COPY TO STDOUT outside pgsql-copy-out-async")))
+         (unless (and (>= (length payload) 3)
+                      (= (length payload)
+                         (+ 3 (* 2 (pgsql--read-uint16 payload 1)))))
+           (signal 'pgsql-protocol-error
+                   (list "Invalid PostgreSQL CopyOutResponse"))))
+        (?d
+         (unless (pgsql--response-copy-function response)
+           (signal 'pgsql-protocol-error
+                   (list "PostgreSQL sent CopyData outside COPY TO STDOUT")))
+         (unless (pgsql--response-copy-error response)
+           (push payload (pgsql--response-copy-rows response))
+           (unless (pgsql--response-copy-pending response)
+             (setf (pgsql--response-copy-pending response) t)
+             (run-at-time 0 nil
+                          (lambda ()
+                            (unwind-protect
+                                (pgsql--deliver-copy-rows response connection)
+                              (setf (pgsql--response-copy-pending response)
+                                    nil)
+                              (when-let* ((finish (pgsql--response-copy-finish
+                                                   response)))
+                                (funcall finish))))))))
+        (?c
+         (unless (zerop (length payload))
+           (signal 'pgsql-protocol-error (list "Invalid PostgreSQL CopyDone"))))
         ((or ?1 ?2 ?3 ?n)
          (unless (zerop (length payload))
            (signal 'pgsql-protocol-error
@@ -1418,16 +1456,18 @@ Return non-nil only when the connection is synchronized again."
           (setf (pgsql--connection-busy-p connection) nil)
         (pgsql--mark-broken connection)))))
 
-(defun pgsql--request-async (connection bytes callback)
+(defun pgsql--request-async (connection bytes callback &optional copy-function)
   "Send request BYTES on CONNECTION and return without waiting.
-CALLBACK is called as described in `pgsql-exec-async'."
+CALLBACK is called as described in `pgsql-exec-async', and COPY-FUNCTION
+as described in `pgsql-copy-out-async'."
   (unless (pgsql-live-p connection)
     (signal 'pgsql-connection-error (list "PostgreSQL connection is not live")))
   (when (pgsql--connection-busy-p connection)
     (signal 'pgsql-connection-error (list "PostgreSQL connection is busy")))
   (setf (pgsql--connection-busy-p connection) t
         (pgsql--connection-pending connection)
-        (pgsql--make-response :callback callback))
+        (pgsql--make-response :callback callback
+                              :copy-function copy-function))
   (let (sent)
     (unwind-protect
         (condition-case err
@@ -1474,11 +1514,52 @@ it is closed.  The callback runs from a timer, outside the filter."
     (if error
         (pgsql--mark-broken connection)
       (setf (pgsql--connection-busy-p connection) nil))
-    (run-at-time 0 nil (pgsql--response-callback response)
+    (run-at-time 0 nil
+                 (lambda (result condition)
+                   (let ((finish
+                          (lambda ()
+                            ;; COPY rows still queued reach the copy function
+                            ;; first.
+                            (when (pgsql--response-copy-function response)
+                              (pgsql--deliver-copy-rows response)
+                              (when-let* ((copy-error
+                                           (pgsql--response-copy-error
+                                            response)))
+                                (setq result nil
+                                      condition copy-error)))
+                            (funcall (pgsql--response-callback response)
+                                     result condition))))
+                     ;; A copy function waiting for output, as writing a
+                     ;; remote file does, lets this timer run; finish once
+                     ;; it returns.
+                     (if (pgsql--response-copy-pending response)
+                         (setf (pgsql--response-copy-finish response) finish)
+                       (funcall finish))))
                  (and outcome (not (cdr outcome)) (car outcome))
                  (or error
                      (and (cdr outcome)
                           (pgsql--server-error-condition (cdr outcome)))))))
+
+(defun pgsql--deliver-copy-rows (response &optional connection)
+  "Pass RESPONSE's queued COPY rows to its copy function, oldest first.
+Once the function signals, keep its condition and drop later rows, also
+those queued while it ran.  While CONNECTION still runs RESPONSE's COPY,
+ask the server to cancel it."
+  (let (rows)
+    (while (and (not (pgsql--response-copy-error response))
+                (setq rows (pgsql--response-copy-rows response)))
+      (setf (pgsql--response-copy-rows response) nil)
+      (condition-case err
+          (funcall (pgsql--response-copy-function response) (nreverse rows))
+        ((error quit)
+         (setf (pgsql--response-copy-error response) err)
+         (when (and connection
+                    (eq (pgsql--connection-pending connection) response))
+           ;; Without a cancel the COPY runs to its end and its rows are
+           ;; dropped, so the condition is still reported once it ends.
+           (condition-case nil
+               (pgsql-cancel connection)
+             (pgsql-error nil))))))))
 
 ;;;; Public connection and query API
 
@@ -1661,6 +1742,21 @@ TYPED-PARAMETERS are as for `pgsql-exec-params', and CALLBACK is called
 as described in `pgsql-exec-async'."
   (pgsql--request-async
    connection (pgsql--extended-query sql typed-parameters) callback))
+
+(defun pgsql-copy-out-async (connection sql function callback)
+  "Start SQL, a COPY ... TO STDOUT statement, on CONNECTION and return nil.
+FUNCTION receives the copied data in order, as lists of unibyte strings,
+each one CopyData message; PostgreSQL sends one per row.  FUNCTION runs
+from a timer, outside the process filter.  It may wait for process
+output, as writing a remote file does, and is not called again until it
+returns.  CALLBACK is called as described in `pgsql-exec-async' after
+FUNCTION's last call has returned; on success RESULT's command tag
+is \"COPY N\", with N rows affected.  When FUNCTION signals, it receives
+no further rows, the server is asked to cancel the command, and CALLBACK
+receives FUNCTION's condition; CONNECTION is then reusable unless it
+also failed."
+  (pgsql--request-async
+   connection (pgsql--message ?Q (pgsql--cstring sql)) callback function))
 
 (defun pgsql--extended-query (sql typed-parameters)
   "Return the Parse through Sync request for SQL with TYPED-PARAMETERS."

@@ -434,5 +434,76 @@ Skip the current test when required live-test configuration is absent."
                      '((14))))
       (should (pgsql-live-p connection)))))
 
+(ert-deftest pgsql-live-test-copy-out-streams-rows-and-cancels ()
+  :tags '(:live)
+  "COPY TO STDOUT should stream rows, and a failing function should cancel it.
+The connection stays reusable after the cancelled COPY."
+  (pgsql-live-test--with-connection connection
+    (let (rows outcome)
+      (pgsql-copy-out-async
+       connection
+       "COPY (SELECT g, 'é' || g FROM generate_series(1, 3) g) TO STDOUT (FORMAT csv)"
+       (lambda (batch) (setq rows (append rows batch)))
+       (lambda (result error) (setq outcome (list result error))))
+      (pgsql-live-test--await (lambda () outcome))
+      (should-not (cadr outcome))
+      (should (equal (pgsql-result-command-tag (car outcome)) "COPY 3"))
+      (should (equal (mapcar (lambda (row) (decode-coding-string row 'utf-8)) rows)
+                     '("1,é1\n" "2,é2\n" "3,é3\n")))
+      (let ((batches 0))
+        (setq outcome nil)
+        ;; Uncancelled, this COPY would run for 100 seconds.
+        (pgsql-copy-out-async
+         connection
+         "COPY (SELECT g, pg_sleep(0.001) FROM generate_series(1, 100000) g) TO STDOUT"
+         (lambda (_batch)
+           (setq batches (1+ batches))
+           (error "Disk full"))
+         (lambda (result error) (setq outcome (list result error))))
+        (pgsql-live-test--await (lambda () outcome))
+        (should (= batches 1))
+        (should (equal outcome '(nil (error "Disk full")))))
+      (should-not (pgsql-busy-p connection))
+      (should (equal (pgsql-result-rows
+                      (pgsql-exec connection "SELECT 15::int4"))
+                     '((15))))
+      (should (pgsql-live-p connection)))))
+
+(ert-deftest pgsql-live-test-copy-out-function-may-wait ()
+  :tags '(:live)
+  "A COPY function that waits for output should get every row once, in order.
+It waits on its first batch until the COPY has ended; the callback still
+follows the function's last call."
+  (pgsql-live-test--with-connection connection
+    (let ((depth 0) (deepest 0) (next 1) (count 0) outcome)
+      (pgsql-copy-out-async
+       connection "COPY (SELECT g FROM generate_series(1, 20000) g) TO STDOUT"
+       (lambda (batch)
+         (setq depth (1+ depth)
+               deepest (max deepest depth))
+         (unwind-protect
+             (progn
+               (when (= next 1)
+                 ;; Wait until the COPY has ended, as a slow write might,
+                 ;; and let its completion run meanwhile.
+                 (with-timeout (10 (ert-fail "The COPY did not end"))
+                   (while (pgsql-busy-p connection)
+                     (accept-process-output nil 0.05)))
+                 (accept-process-output nil 0.05))
+               (dolist (row batch)
+                 (setq count (1+ count))
+                 (when (equal row (format "%d\n" next))
+                   (setq next (1+ next)))))
+           (setq depth (1- depth))))
+       (lambda (result error)
+         (setq outcome (list result error depth))))
+      (pgsql-live-test--await (lambda () outcome))
+      (should-not (cadr outcome))
+      (should (equal (pgsql-result-command-tag (car outcome)) "COPY 20000"))
+      (should (= deepest 1))
+      (should (= (nth 2 outcome) 0))
+      (should (= count 20000))
+      (should (= next 20001)))))
+
 (provide 'pgsql-live-test)
 ;;; pgsql-live-test.el ends here
