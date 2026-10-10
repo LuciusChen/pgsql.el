@@ -6,7 +6,7 @@ Notable user-visible changes are recorded here.
 
 ### Added
 
-- `pgsql-copy-out-async` runs a `COPY ... TO STDOUT` statement without waiting and passes the copied rows, in order and from timers, to a function as they arrive, then calls the callback as `pgsql-exec-async` does. A function that signals stops the transfer: the command is cancelled and the callback receives that condition. `COPY FROM STDIN` remains unsupported.
+- `pgsql-copy-out-async` runs a `COPY ... TO STDOUT` statement without waiting and passes the copied rows, in order and from timers, to a function as they arrive, then calls the callback as `pgsql-exec-async` does. The function may wait for process output, as writing a remote file does: it is not called again until it returns, and the callback follows its last call. A function that signals stops the transfer: the command is cancelled and the callback receives that condition. `COPY FROM STDIN` remains unsupported.
 
 ## 0.2.0 - 2026-10-02
 

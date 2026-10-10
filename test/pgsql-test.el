@@ -792,6 +792,59 @@ and the connection stays reusable."
         (should-not (pgsql-busy-p connection))
         (should-not (pgsql--connection-broken-p connection))))))
 
+(ert-deftest pgsql-test-copy-out-function-may-wait-for-output ()
+  "FUNCTION may wait for process output and is not called again meanwhile.
+When the COPY ends while FUNCTION waits, the rows that arrived reach it
+once it returns, and CALLBACK runs after its last call.  If it signals
+instead, it gets none of them."
+  (dolist (fail '(nil t))
+    (ert-info ((if fail "FUNCTION signals" "FUNCTION returns"))
+      (pgsql-test--with-connection connection
+        (let ((rest (concat (pgsql-test--message ?d (pgsql-test--bytes "2\n"))
+                            (pgsql-test--message ?d (pgsql-test--bytes "3\n"))
+                            (pgsql-test--message ?c "")
+                            (pgsql-test--message ?C (pgsql-test--bytes "COPY 3\0"))
+                            (pgsql-test--message ?Z (unibyte-string ?I))))
+              (depth 0)
+              events)
+          (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                    ((symbol-function 'process-send-string) #'ignore))
+            (pgsql-copy-out-async
+             connection "COPY t TO STDOUT"
+             (lambda (rows)
+               (push (list 'rows depth rows) events)
+               (setq depth (1+ depth))
+               (unwind-protect
+                   (when (equal rows (list (pgsql-test--bytes "1\n")))
+                     ;; The rest of the COPY arrives while FUNCTION waits.
+                     (pgsql--receive connection rest)
+                     (pgsql-test--run-due-timers)
+                     (when fail
+                       (error "Disk full")))
+                 (setq depth (1- depth))))
+             (lambda (result error)
+               (push (list 'done depth
+                           (and result (pgsql-result-command-tag result))
+                           error)
+                     events)))
+            (pgsql--receive connection
+                            (concat (pgsql-test--copy-out-response 1)
+                                    (pgsql-test--message
+                                     ?d (pgsql-test--bytes "1\n"))))
+            (pgsql-test--run-due-timers)
+            (pgsql-test--run-due-timers)
+            (should
+             (equal (reverse events)
+                    `((rows 0 (,(pgsql-test--bytes "1\n")))
+                      ,@(unless fail
+                          `((rows 0 (,(pgsql-test--bytes "2\n")
+                                     ,(pgsql-test--bytes "3\n")))))
+                      ,(if fail
+                           '(done 0 nil (error "Disk full"))
+                         '(done 0 "COPY 3" nil)))))
+            (should-not (pgsql-busy-p connection))
+            (should-not (pgsql--connection-broken-p connection))))))))
+
 (ert-deftest pgsql-test-copy-out-rejects-malformed-copy-messages ()
   "A malformed CopyOutResponse or CopyDone should close the connection."
   (pcase-dolist

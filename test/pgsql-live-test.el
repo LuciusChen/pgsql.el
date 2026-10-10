@@ -469,5 +469,36 @@ The connection stays reusable after the cancelled COPY."
                      '((15))))
       (should (pgsql-live-p connection)))))
 
+(ert-deftest pgsql-live-test-copy-out-function-may-wait ()
+  :tags '(:live)
+  "A COPY function that waits for output should get every row once, in order.
+Waiting on its first batch lets the rest of the COPY, and its end, arrive
+meanwhile; the callback still follows the function's last call."
+  (pgsql-live-test--with-connection connection
+    (let ((depth 0) (deepest 0) (next 1) (count 0) outcome)
+      (pgsql-copy-out-async
+       connection "COPY (SELECT g FROM generate_series(1, 20000) g) TO STDOUT"
+       (lambda (batch)
+         (setq depth (1+ depth)
+               deepest (max deepest depth))
+         (unwind-protect
+             (progn
+               (when (= next 1)
+                 (accept-process-output nil 0.5))
+               (dolist (row batch)
+                 (setq count (1+ count))
+                 (when (equal row (format "%d\n" next))
+                   (setq next (1+ next)))))
+           (setq depth (1- depth))))
+       (lambda (result error)
+         (setq outcome (list result error depth))))
+      (pgsql-live-test--await (lambda () outcome))
+      (should-not (cadr outcome))
+      (should (equal (pgsql-result-command-tag (car outcome)) "COPY 20000"))
+      (should (= deepest 1))
+      (should (= (nth 2 outcome) 0))
+      (should (= count 20000))
+      (should (= next 20001)))))
+
 (provide 'pgsql-live-test)
 ;;; pgsql-live-test.el ends here
