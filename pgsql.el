@@ -337,22 +337,29 @@ A pending asynchronous request then consumes every complete message."
 
 (defun pgsql--take-message (connection)
   "Consume one complete backend message from CONNECTION, or return nil."
-  (when (>= (pgsql--available-bytes connection) 5)
+  (with-current-buffer (pgsql--connection-input-buffer connection)
     (let* ((start (pgsql--connection-read-position connection))
-           (header (with-current-buffer (pgsql--connection-input-buffer connection)
-                     (buffer-substring-no-properties start (+ start 5))))
-           (type (aref header 0))
-           (length (pgsql--read-uint32 header 1)))
-      (when (< length 4)
-        (signal 'pgsql-protocol-error
-                (list (format "Invalid PostgreSQL message length: %d" length))))
-      (when (> length pgsql-max-message-bytes)
-        (signal 'pgsql-protocol-error
-                (list (format "PostgreSQL message exceeds %d bytes"
-                              pgsql-max-message-bytes))))
-      (when (>= (pgsql--available-bytes connection) (1+ length))
-        (pgsql--take-bytes connection 5)
-        (cons type (pgsql--take-bytes connection (- length 4)))))))
+           (available (- (point-max) start)))
+      (when (>= available 5)
+        (let ((type (char-after start))
+              (length (+ (ash (char-after (+ start 1)) 24)
+                         (ash (char-after (+ start 2)) 16)
+                         (ash (char-after (+ start 3)) 8)
+                         (char-after (+ start 4)))))
+          (when (< length 4)
+            (signal 'pgsql-protocol-error
+                    (list (format "Invalid PostgreSQL message length: %d" length))))
+          (when (> length pgsql-max-message-bytes)
+            (signal 'pgsql-protocol-error
+                    (list (format "PostgreSQL message exceeds %d bytes"
+                                  pgsql-max-message-bytes))))
+          (when (>= available (1+ length))
+            (let ((payload (buffer-substring-no-properties
+                            (+ start 5) (+ start 1 length))))
+              (setf (pgsql--connection-read-position connection)
+                    (+ start 1 length))
+              (pgsql--compact-input connection)
+              (cons type payload))))))))
 
 (defun pgsql--remaining-time (deadline)
   "Return seconds remaining before DEADLINE, or nil without a deadline."
