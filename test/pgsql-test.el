@@ -75,6 +75,19 @@
                      (cons ?C (pgsql-test--bytes "SELECT 1\0"))))
       (should-not (pgsql--take-message connection)))))
 
+(ert-deftest pgsql-test-framing-discards-consumed-input ()
+  "Consuming messages should not let the input buffer grow without bound."
+  (pgsql-test--with-connection connection
+    (let ((message (concat (unibyte-string ?d 0 0 #x03 #xec)
+                           (make-string 1000 ?x))))
+      (dotimes (_ 200)
+        (pgsql--receive connection message)
+        (should (equal (pgsql--take-message connection)
+                       (cons ?d (make-string 1000 ?x)))))
+      (should-not (pgsql--take-message connection))
+      (with-current-buffer (pgsql--connection-input-buffer connection)
+        (should (< (buffer-size) 70000))))))
+
 (ert-deftest pgsql-test-framing-rejects-invalid-lengths ()
   "Malformed and oversized frame lengths should fail before consumption."
   (pgsql-test--with-connection connection

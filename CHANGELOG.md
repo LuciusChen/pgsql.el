@@ -8,6 +8,10 @@ Notable user-visible changes are recorded here.
 
 - `pgsql-copy-out-async` runs a `COPY ... TO STDOUT` statement without waiting and passes the copied rows, in order and from timers, to a function as they arrive, then calls the callback as `pgsql-exec-async` does. The function may wait for process output, as writing a remote file does: it is not called again until it returns, and the callback follows its last call. A function that signals stops the transfer: the command is cancelled and the callback receives that condition. `COPY FROM STDIN` remains unsupported.
 
+### Changed
+
+- Reading a backend message makes one string for its payload instead of three, which speeds up large results and COPY streams: streaming 181 MB through `pgsql-copy-out-async` into a file took 3.4 s in Emacs 30 with 32 MB of garbage collection headroom, and now takes 2.5 s.
+
 ## 0.2.0 - 2026-10-02
 
 ### Added
