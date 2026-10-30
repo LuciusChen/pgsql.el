@@ -137,7 +137,8 @@ Zero means no timeout."
   columns
   rows
   command-tag
-  affected-rows)
+  affected-rows
+  notices)
 
 (cl-defstruct (pgsql--response
                (:constructor pgsql--make-response)
@@ -147,7 +148,8 @@ CALLBACK is set only for an asynchronous request, and COPY-FUNCTION only
 for `pgsql-copy-out-async'.  COPY-ROWS holds CopyData payloads not yet
 passed to it, newest first; COPY-PENDING is non-nil while their delivery
 is scheduled or running, and COPY-FINISH completes the request once that
-delivery returns; COPY-ERROR is the condition it signaled."
+delivery returns; COPY-ERROR is the condition it signaled.  NOTICES
+holds the notice fields received so far, newest first."
   columns
   rows
   final-columns
@@ -160,7 +162,8 @@ delivery returns; COPY-ERROR is the condition it signaled."
   copy-rows
   copy-pending
   copy-finish
-  copy-error)
+  copy-error
+  notices)
 
 (defun pgsql-connection-p (value)
   "Return non-nil when VALUE is a PostgreSQL connection."
@@ -185,6 +188,11 @@ delivery returns; COPY-ERROR is the condition it signaled."
 (defun pgsql-result-affected-rows (result)
   "Return the affected-row count from RESULT, or nil."
   (pgsql--result-affected-rows result))
+
+(defun pgsql-result-notices (result)
+  "Return the notices the server sent while producing RESULT, oldest first.
+Each is a plist of structured fields, as `pgsql-notice-functions' receive."
+  (pgsql--result-notices result))
 
 (defconst pgsql--error-field-names
   '((?S . :severity-localized)
@@ -1307,7 +1315,8 @@ ReadyForQuery ends RESPONSE, and nil before then."
                  :columns (pgsql--response-final-columns response)
                  :rows (pgsql--response-final-rows response)
                  :command-tag command-tag
-                 :affected-rows (pgsql--affected-rows command-tag))
+                 :affected-rows (pgsql--affected-rows command-tag)
+                 :notices (reverse (pgsql--response-notices response)))
                 (pgsql--response-server-error response)))
       (pcase type
         (?T
@@ -1383,6 +1392,9 @@ ReadyForQuery ends RESPONSE, and nil before then."
            (signal 'pgsql-protocol-error
                    (list "Invalid PostgreSQL completion message"))))
         (_
+         (when (eq type ?N)
+           (push (pgsql--error-fields payload)
+                 (pgsql--response-notices response)))
          (unless (pgsql--handle-side-message connection type payload)
            (signal 'pgsql-protocol-error
                    (list (format "Unexpected PostgreSQL query message: %c"

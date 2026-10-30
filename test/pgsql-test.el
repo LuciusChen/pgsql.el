@@ -671,6 +671,40 @@ string encodes it with the preferred coding system instead."
           (should (equal (pgsql-result-command-tag result) "SELECT 1")))
         (should (eq (pgsql-transaction-status connection) 'in-transaction))))))
 
+(ert-deftest pgsql-test-result-carries-the-notices-of-its-request ()
+  "A result should carry the notices sent during its request, oldest first.
+They still reach `pgsql-notice-functions', and none carry over to the next
+request."
+  (pgsql-test--with-connection connection
+    (let* (hooked calls
+           (notice
+            (lambda (message)
+              (pgsql-test--message
+               ?N (pgsql-test--bytes
+                   (format "SNOTICE\0VNOTICE\0C00000\0M%s\0\0" message)))))
+           (done (concat (pgsql-test--message ?C (pgsql-test--bytes "DO\0"))
+                         (pgsql-test--message ?Z (unibyte-string ?I))))
+           (pgsql-notice-functions
+            (list (lambda (_connection fields)
+                    (push (plist-get fields :message) hooked)))))
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'process-send-string) #'ignore))
+        (pgsql-exec-async connection "DO $$ BEGIN END $$"
+                          (lambda (result error)
+                            (push (list result error) calls)))
+        (pgsql--receive connection (concat (funcall notice "first")
+                                           (funcall notice "second")
+                                           done done))
+        (pgsql-test--run-due-timers)
+        (let ((notices (pgsql-result-notices (caar calls))))
+          (should (equal (mapcar (lambda (fields) (plist-get fields :message))
+                                 notices)
+                         '("first" "second")))
+          (should (equal (plist-get (car notices) :sqlstate) "00000")))
+        (should (equal hooked '("second" "first")))
+        (should-not (pgsql-result-notices
+                     (pgsql-exec connection "DO $$ BEGIN END $$")))))))
+
 (ert-deftest pgsql-test-async-server-error-keeps-connection-reusable ()
   "A server error should reach the callback once the response is synchronized."
   (pgsql-test--with-connection connection

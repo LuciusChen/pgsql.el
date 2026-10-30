@@ -2,6 +2,12 @@
 
 Notable user-visible changes are recorded here.
 
+## Unreleased
+
+### Added
+
+- `pgsql-result-notices` returns the notices the server sent while producing a result, such as `RAISE NOTICE` output or `VACUUM VERBOSE` progress, as structured field plists, oldest first. Each request starts with none, so a caller no longer has to tell which request a notice from `pgsql-notice-functions` belongs to. Those functions still receive every notice.
+
 ## 0.3.0 - 2026-10-16
 
 ### Added
