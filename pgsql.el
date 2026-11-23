@@ -1401,12 +1401,11 @@ ReadyForQuery ends RESPONSE, and nil before then."
                                  type))))))
       nil)))
 
-(defun pgsql--collect-result (connection &optional deadline)
-  "Collect one CONNECTION response through ReadyForQuery.
+(defun pgsql--collect-result (connection response &optional deadline)
+  "Continue collecting RESPONSE from CONNECTION through ReadyForQuery.
 Return a cons of result and structured server error fields.
 Optional absolute DEADLINE bounds the whole recovery exchange."
   (let ((timeout (pgsql--connection-read-timeout connection))
-        (response (pgsql--make-response))
         outcome)
     (while (not outcome)
       (when (and deadline (zerop (pgsql--remaining-time deadline)))
@@ -1426,8 +1425,8 @@ to send a Terminate message over the presumed-unsynchronized transport."
   (setf (pgsql--connection-broken-p connection) t)
   (pgsql-disconnect connection))
 
-(defun pgsql--cancel-and-drain (connection)
-  "Cancel CONNECTION's active request and drain it through ReadyForQuery.
+(defun pgsql--cancel-and-drain (connection response)
+  "Cancel CONNECTION's active request and drain RESPONSE through ReadyForQuery.
 Return non-nil only when the connection is synchronized again."
   (let* ((deadline (+ (float-time) pgsql--cancel-recovery-timeout))
          (inhibit-quit t)
@@ -1435,7 +1434,7 @@ Return non-nil only when the connection is synchronized again."
     (condition-case nil
         (progn
           (pgsql--cancel-with-deadline connection deadline)
-          (pgsql--collect-result connection deadline)
+          (pgsql--collect-result connection response deadline)
           (setq synchronized t))
       (error nil))
     synchronized))
@@ -1447,22 +1446,22 @@ Return non-nil only when the connection is synchronized again."
   (when (pgsql--connection-busy-p connection)
     (signal 'pgsql-connection-error (list "PostgreSQL connection is busy")))
   (setf (pgsql--connection-busy-p connection) t)
-  (let (sent synchronized response)
+  (let ((response (pgsql--make-response)) sent synchronized outcome)
     (unwind-protect
         (condition-case err
             (progn
               (setq sent t)
               (pgsql--send connection bytes)
-              (setq response (pgsql--collect-result connection)
+              (setq outcome (pgsql--collect-result connection response)
                     synchronized t)
-              (if (cdr response)
-                  (pgsql--signal-server-error (cdr response))
-                (car response)))
+              (if (cdr outcome)
+                  (pgsql--signal-server-error (cdr outcome))
+                (car outcome)))
           ;; The statement may still be running: cancel it and drain its
           ;; response, so it cannot commit after the caller gave up.
           ((quit pgsql-timeout)
            (when (or (not sent)
-                     (pgsql--cancel-and-drain connection))
+                     (pgsql--cancel-and-drain connection response))
              (setq synchronized t))
            (signal (car err) (cdr err)))
           (pgsql-error
