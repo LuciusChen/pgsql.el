@@ -2,6 +2,12 @@
 
 Notable user-visible changes are recorded here.
 
+## Unreleased
+
+### Fixed
+
+- Cancelling or timing out a synchronous query while rows are arriving now preserves the connection when its remaining response can be drained.
+
 ## 0.3.1 - 2026-10-31
 
 ### Added
