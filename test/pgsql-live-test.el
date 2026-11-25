@@ -84,15 +84,18 @@ Skip the current test when required live-test configuration is absent."
 (ert-deftest pgsql-live-test-connects-with-scram-credentials ()
   :tags '(:live)
   "Connect to a server configured for SCRAM-SHA-256 password authentication."
-  (pgsql-live-test--with-connection connection
-    (should (pgsql-live-p connection))
-    (should-not (pgsql-busy-p connection))
-    (should (eq (pgsql-transaction-status connection) 'idle))
-    (should (equal (pgsql-parameter connection "client_encoding") "UTF8"))
-    (should
-     (equal
-      (pgsql-result-rows (pgsql-exec connection "SHOW password_encryption"))
-      '(("scram-sha-256"))))))
+  (let ((finish (symbol-function 'pgsql--scram-finish))
+        verified)
+    (cl-letf (((symbol-function 'pgsql--scram-finish)
+               (lambda (state final)
+                 (prog1 (funcall finish state final)
+                   (setq verified t)))))
+      (pgsql-live-test--with-connection connection
+        (should verified)
+        (should (pgsql-live-p connection))
+        (should-not (pgsql-busy-p connection))
+        (should (eq (pgsql-transaction-status connection) 'idle))
+        (should (equal (pgsql-parameter connection "client_encoding") "UTF8"))))))
 
 (ert-deftest pgsql-live-test-scram-prepares-non-ascii-passwords ()
   :tags '(:live)
