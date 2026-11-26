@@ -4,6 +4,10 @@ Notable user-visible changes are recorded here.
 
 ## Unreleased
 
+### Added
+
+- `pgsql-exec-rows-async` delivers decoded rows in batches while a single statement runs.
+
 ### Fixed
 
 - Cancelling or timing out a synchronous query while rows are arriving now preserves the connection when its remaining response can be drained.
