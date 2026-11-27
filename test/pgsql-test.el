@@ -116,7 +116,15 @@
     (should (= (length row) 3))
     (should (pgsql-null-p (nth 0 row)))
     (should (equal (nth 1 row) ""))
-    (should (equal (nth 2 row) "你好"))))
+    (should (equal (nth 2 row) "你好"))
+    ;; Drain rejected stream rows through ReadyForQuery without decoding values.
+    (let ((response (pgsql--make-response :columns columns :stream-kind 'rows
+                                          :stream-error '(error "Disk full"))))
+      (cl-letf (((symbol-function 'pgsql--decode-value)
+                 (lambda (&rest _) (ert-fail "Decoded a discarded value"))))
+        (pgsql--response-step nil response (cons ?D payload))
+        (should-error (pgsql--response-step nil response (cons ?D (substring payload 0 -1)))
+                      :type 'pgsql-protocol-error)))))
 
 (ert-deftest pgsql-test-row-description-rejects-binary-format ()
   "A binary RowDescription should fail before any DataRow is read."

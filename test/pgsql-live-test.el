@@ -437,6 +437,25 @@ Skip the current test when required live-test configuration is absent."
                      '((14))))
       (should (pgsql-live-p connection)))))
 
+(ert-deftest pgsql-live-test-stream-query-rows ()
+  :tags '(:live)
+  "A streamed statement delivers the same columns and values as an ordinary one."
+  (pgsql-live-test--with-connection connection
+    (dolist (sql '("SELECT n, n=2 AS flag, NULL::text FROM generate_series(1, 5) n"
+                   "SELECT 1 AS n WHERE false"))
+      (let ((expected (pgsql-exec connection sql)) rows outcome)
+        (pgsql-exec-rows-async
+         connection sql
+         (lambda (batch)
+           (should (equal (pgsql-result-columns batch) (pgsql-result-columns expected)))
+           (setq rows (nconc rows (pgsql-result-rows batch))))
+         (lambda (result error) (setq outcome (list result error))))
+        (pgsql-live-test--await (lambda () outcome))
+        (should-not (cadr outcome))
+        (should (equal rows (pgsql-result-rows expected)))
+        (should-not (pgsql-result-rows (car outcome)))
+        (should (equal (pgsql-result-columns (car outcome)) (pgsql-result-columns expected)))))))
+
 (ert-deftest pgsql-live-test-copy-out-streams-rows-and-cancels ()
   :tags '(:live)
   "COPY TO STDOUT should stream rows, and a failing function should cancel it.
