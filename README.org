@@ -2,37 +2,28 @@
 
 [[https://melpa.org/#/pgsql][file:https://melpa.org/packages/pgsql-badge.svg]]
 
-=pgsql.el= is a native PostgreSQL wire-protocol client written in Emacs Lisp. It is intended to provide a small, public protocol API without an external =psql= process, JDBC bridge, or user-interface dependency.
+A native PostgreSQL wire-protocol (v3) client written in Emacs Lisp, with no =psql= subprocess, JDBC bridge, or third-party runtime dependencies. Requires Emacs 29.1 or newer.
 
 * Scope
 
-The package supports simple and parameterized queries, asynchronous execution, =COPY ... TO STDOUT=, and cancellation. Its API is exercised by [[https://github.com/LuciusChen/clutch][Clutch's native PostgreSQL adapter]].
+=pgsql.el= handles protocol work only: simple and parameterized queries, asynchronous execution, =COPY ... TO STDOUT= streaming, and query cancellation. Higher-level features like query consoles, result grids, completion, or connection pooling belong in applications built on top of it (such as [[https://github.com/LuciusChen/clutch][Clutch]]).
 
-The package is protocol-only. Query consoles, result rendering, completion, schema browsers, saved connections, SQL rewriting, connection pooling, and automatic SQL replay belong to applications built on top of it.
+** Relationship to pg.el
 
-* Relationship to pg.el
+MELPA already has [[https://github.com/emarsden/pg-el][pg.el]], which is mature and much broader (including Unix-domain sockets, idle LISTEN/NOTIFY handling, extensible type decoders, and wide server coverage). If you need those features, use =pg.el=.
 
-MELPA already provides [[https://github.com/emarsden/pg-el][pg.el]], a mature and broad PostgreSQL client with COPY support, asynchronous idle LISTEN/NOTIFY handling, Unix-domain sockets, extensible type decoding, and a large server-compatibility matrix. =pgsql.el= is not a fork or drop-in replacement and does not try to match that feature breadth; applications that need those capabilities should use pg.el.
-
-=pgsql.el= provides a narrower protocol-library boundary for application clients: no third-party runtime dependency, opaque connection and result values, one request in flight, completion only after the matching =ReadyForQuery= has been consumed, authoritative public transaction state, a dedicated SQL NULL value distinct from PostgreSQL false, and bounded cancellation that drains the original connection before reuse. Those lifecycle guarantees let callers such as Clutch depend on public protocol state without reaching into transport internals or maintaining caller-side synchronization workarounds.
-
-* Requirements
-
-- Emacs 29.1 or newer
-- PostgreSQL is required only for the live test suite
-
-The package has no third-party runtime dependency.
+=pgsql.el= is aimed at callers that want a narrower, predictable protocol library: zero external dependencies, one request in flight per connection, every request drained cleanly through =ReadyForQuery=, explicit =pgsql-null= distinct from boolean =nil=, server-reported transaction state, and cancellation that leaves the connection synchronized before reuse.
 
 * Installation
 
-=pgsql= is available from [[https://melpa.org/#/pgsql][MELPA]]. After configuring MELPA, install it with =M-x package-install RET pgsql RET=, or declare it with =use-package=:
+Install from [[https://melpa.org/#/pgsql][MELPA]] with =M-x package-install RET pgsql RET=, or via =use-package=:
 
 #+begin_src emacs-lisp
 (use-package pgsql
   :ensure t)
 #+end_src
 
-For a source checkout, clone the repository and add it to =load-path=:
+Or from a source checkout:
 
 #+begin_src emacs-lisp
 (add-to-list 'load-path "/path/to/pgsql.el")
@@ -41,32 +32,34 @@ For a source checkout, clone the repository and add it to =load-path=:
 
 * Usage
 
-Connect with keyword arguments and always close the connection when its owner is finished:
+** Connecting and TLS
+
+Connect with keyword arguments and always disconnect when done:
 
 #+begin_src emacs-lisp
-(setq connection
-      (pgsql-connect :host "127.0.0.1"
-                     :port 5432
-                     :user "app"
-                     :password "secret"
-                     :database "app"
-                     :sslmode 'prefer))
-
-(unwind-protect
-    (pgsql-result-rows
-     (pgsql-exec connection "SELECT current_database()"))
-  (pgsql-disconnect connection))
+(let ((conn (pgsql-connect :host "127.0.0.1"
+                           :port 5432
+                           :user "app"
+                           :password "secret"
+                           :database "app"
+                           :sslmode 'prefer)))
+  (unwind-protect
+      (pgsql-result-rows
+       (pgsql-exec conn "SELECT current_database()"))
+    (pgsql-disconnect conn)))
 #+end_src
 
-=pgsql-connect= supports =disable=, =prefer=, =require=, and =verify-full= SSL modes. =prefer= falls back to plaintext only when the server explicitly rejects the PostgreSQL SSL request; TLS handshake and certificate failures are never hidden. SCRAM-SHA-256 passwords use PostgreSQL-compatible SASLprep, including PostgreSQL's raw-password fallback for input that cannot be prepared.
+=:sslmode= accepts =disable=, =prefer=, =require=, and =verify-full=. Under =prefer=, plaintext fallback happens only when the server explicitly rejects SSL; TLS handshake and certificate errors are always signaled. SCRAM-SHA-256 authentication uses PostgreSQL-compatible SASLprep (with raw-password fallback when input cannot be prepared).
 
-The connection object is opaque. Use =pgsql-user=, =pgsql-host=, =pgsql-port=, =pgsql-database=, =pgsql-live-p=, =pgsql-busy-p=, =pgsql-transaction-status=, and =pgsql-parameter= instead of depending on transport state. =pgsql-connect-timeout= bounds the complete TCP, TLS, and authentication sequence; =pgsql-read-timeout= is an idle timeout and restarts whenever a fragmented response makes progress. =pgsql-set-connect-timeout= changes the bound used by later auxiliary cancellation connections, while =pgsql-set-read-timeout= changes the response idle timeout.
+Connections are opaque. Inspect them with =pgsql-user=, =pgsql-host=, =pgsql-port=, =pgsql-database=, =pgsql-live-p=, =pgsql-busy-p=, =pgsql-transaction-status=, and =pgsql-parameter=. =pgsql-connect-timeout= bounds the TCP, TLS, and auth sequence; =pgsql-read-timeout= is an idle timeout that resets as response chunks arrive. Both can be updated per connection with =pgsql-set-connect-timeout= and =pgsql-set-read-timeout=.
 
-Use =pgsql-exec-params= for an extended-protocol query. Each parameter is a cons of its value and optional PostgreSQL type name. =pgsql-null= represents SQL NULL, while Lisp =nil= represents PostgreSQL boolean false:
+** Parameterized queries and type decoding
+
+Use =pgsql-exec-params= for extended-protocol queries. Pass each parameter as =(value . type-name)=. Use =pgsql-null= for SQL NULL; Lisp =nil= means PostgreSQL boolean =false=:
 
 #+begin_src emacs-lisp
 (pgsql-exec-params
- connection
+ conn
  "SELECT $1::int4, $2::text, $3::boolean, $4::int4[]"
  (list (cons 42 "int4")
        (cons pgsql-null "text")
@@ -74,34 +67,40 @@ Use =pgsql-exec-params= for an extended-protocol query. Each parameter is a cons
        (cons (vector 1 pgsql-null 3) "int4[]")))
 #+end_src
 
-Recognized built-in type names are sent as Parse OIDs. Unknown, extension, and domain type names remain valid local encoding hints while PostgreSQL infers their type from the SQL context.
+Built-in type names are sent as Parse OIDs; unknown, extension, or domain names still act as local encoding hints while PostgreSQL infers the server type.
 
-Both query functions consume the complete response through =ReadyForQuery= before returning or signaling. =pgsql-transaction-status= reports =idle=, =in-transaction=, or =failed-transaction= from that server message. A structured =pgsql-server-error= retains fields such as =:sqlstate=, =:detail=, and =:constraint= through =pgsql-error-fields=, and the same connection remains reusable after a synchronized server error.
+Results expose =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, =pgsql-result-affected-rows=, and =pgsql-result-notices= (such as =RAISE NOTICE= output, oldest first). Column metadata uses =pgsql-column-name=, =pgsql-column-type-oid=, and =pgsql-column-type-name=. Core scalar and array columns decode from PostgreSQL text format (binary result columns are rejected explicitly rather than guessed):
 
-=NotificationResponse= messages encountered while reading a response are delivered through =pgsql-notification-functions= with the connection and a plist containing =:pid=, =:channel=, and =:payload=. =pgsql.el= does not poll or dispatch messages while a connection is idle.
+- Unknown types stay UTF-8 strings with their OID preserved.
+- =numeric=, =date=, and wall-clock =timestamp= stay exact text; =timestamptz= decodes to an Emacs time value.
+- =bytea= uses unibyte strings and accepts both PostgreSQL hex and escape formats.
 
-Results expose =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, =pgsql-result-affected-rows=, and =pgsql-result-notices=, which lists the notices the server sent while producing the result, such as =RAISE NOTICE= output, as structured field plists, oldest first. Column metadata is read through =pgsql-column-name=, =pgsql-column-type-oid=, and =pgsql-column-type-name=. Core scalar and array values are decoded from PostgreSQL text format; binary result columns are rejected explicitly rather than guessed. Unknown types remain UTF-8 strings with their OID preserved in the column metadata. Arbitrary-precision =numeric= and wall-clock =date=/=timestamp= values remain exact text, while =timestamptz= becomes an Emacs time value. =bytea= parameters and results use unibyte strings and accept either PostgreSQL hex or escape output.
+** Transactions, errors, and cancellation
 
-=pgsql-cancel= sends PostgreSQL's CancelRequest over a separate short-lived connection. The original query path still consumes the cancellation error and its final =ReadyForQuery= before it becomes reusable. A keyboard quit or a read timeout during =pgsql-exec= or =pgsql-exec-params= performs this cancellation and drain internally before re-signaling =quit= or =pgsql-timeout=; if synchronization fails, the connection is closed instead of being returned in an unknown state.
+Both =pgsql-exec= and =pgsql-exec-params= read the full response through =ReadyForQuery= before returning or signaling. =pgsql-transaction-status= returns =idle=, =in-transaction=, or =failed-transaction= directly from that server message. Structured server errors signal =pgsql-server-error= (read fields like =:sqlstate=, =:detail=, and =:constraint= via =pgsql-error-fields=), and the connection stays reusable afterward. Any =NotificationResponse= received during a query is passed to =pgsql-notification-functions= with =(conn plist)= containing =:pid=, =:channel=, and =:payload=; idle connections are not polled.
 
-=pgsql-exec-async= and =pgsql-exec-params-async= send the same requests without waiting and return =nil=. The process filter reads the response as it arrives, and the callback then runs once, from a timer, with the result and =nil=, or with =nil= and an error condition: after a =pgsql-server-error= the connection is synchronized and reusable, and after any other condition it is closed. The connection stays busy until the callback is scheduled, so other requests on it are refused. The read timeout does not apply; =pgsql-cancel= asks the server to stop the command, which then completes with the server's verdict.
+=pgsql-cancel= sends PostgreSQL's CancelRequest over a short-lived auxiliary connection while the original query drains its cancellation error and final =ReadyForQuery=. Pressing =C-g= or hitting a read timeout during a synchronous query runs this cancel-and-drain flow automatically before re-signaling =quit= or =pgsql-timeout=; if resynchronization fails, the connection is closed.
+
+** Asynchronous queries and COPY
+
+=pgsql-exec-async= and =pgsql-exec-params-async= return =nil= immediately and invoke their callback once from a timer with =(result error)=. The connection stays busy until then. After a =pgsql-server-error= the connection stays reusable; any other error closes it. The read timeout does not apply to async queries; use =pgsql-cancel= to stop one.
 
 #+begin_src emacs-lisp
 (pgsql-exec-async
- connection "SELECT count(*) FROM big_table"
+ conn "SELECT count(*) FROM big_table"
  (lambda (result error)
    (if error
        (message "Failed: %s" (error-message-string error))
      (message "Rows: %S" (pgsql-result-rows result)))))
 #+end_src
 
-=pgsql-exec-rows-async= executes one statement and delivers each nonempty batch as a =pgsql-result= with the same columns and decoded values as an ordinary query. The final callback receives the column metadata and command tag even for an empty result. It does not retain the delivered rows. Batch delivery, cancellation and consumer errors follow the same rules as COPY below.
+For large results, =pgsql-exec-rows-async= delivers decoded batches as =pgsql-result= objects without holding all rows in memory, and still calls the final callback with column metadata and command tag even for empty results.
 
-=pgsql-copy-out-async= runs a =COPY ... TO STDOUT= statement the same way and delivers the copied data in batches. Rows that arrive while the function is waiting accumulate in memory until it returns. The function receives lists of unibyte strings in order, one string per CopyData message, which PostgreSQL sends per row, and it runs from a timer, outside the process filter. It may wait for process output, as writing a remote file does, and is not called again until it returns. The callback runs after the function's last call has returned, and its result's command tag is =COPY N=. If the function signals, it receives no further rows, the command is cancelled, and the callback receives that condition once the connection is synchronized. =COPY FROM STDIN= is not supported, and the synchronous functions treat COPY data as a protocol error.
+=pgsql-copy-out-async= streams =COPY ... TO STDOUT= in batches of unibyte row strings, invoking the consumer from a timer outside the process filter and waiting for each call to return before sending the next batch. If the consumer signals an error, the command is cancelled and the final callback receives that error once drained. (=COPY FROM STDIN= is not supported.)
 
 #+begin_src emacs-lisp
 (pgsql-copy-out-async
- connection "COPY (SELECT * FROM big_table) TO STDOUT (FORMAT csv, HEADER)"
+ conn "COPY (SELECT * FROM big_table) TO STDOUT (FORMAT csv, HEADER)"
  (lambda (rows)
    (with-temp-buffer
      (set-buffer-multibyte nil)
@@ -115,26 +114,25 @@ Results expose =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-comman
 
 * Public API
 
-Connections and results are opaque values. Callers use the public symbols below and must not inspect their representation or call =pgsql--= symbols.
+Connections and results are opaque; use only the public =pgsql-*= symbols below (never =pgsql--*=):
 
-- Connection lifecycle: =pgsql-connect=, =pgsql-disconnect=, and =pgsql-connection-p=. =pgsql-connect= accepts =:database=, =:user=, =:password=, =:host=, =:port=, =:sslmode=, =:connect-timeout=, =:read-timeout=, and =:application-name=.
-- Connection defaults and bounds: =pgsql-connect-timeout=, =pgsql-read-timeout=, =pgsql-sslmode=, =pgsql-application-name=, and =pgsql-max-message-bytes=. =pgsql-set-connect-timeout= and =pgsql-set-read-timeout= change the corresponding bounds on an existing connection.
-- Connection state and metadata: =pgsql-live-p=, =pgsql-busy-p=, =pgsql-transaction-status=, =pgsql-parameter=, =pgsql-user=, =pgsql-host=, =pgsql-port=, and =pgsql-database=.
-- Execution and cancellation: =pgsql-exec=, =pgsql-exec-params=, =pgsql-exec-async=, =pgsql-exec-params-async=, =pgsql-exec-rows-async=, =pgsql-copy-out-async=, and =pgsql-cancel=.
-- Results: =pgsql-result-p=, =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, =pgsql-result-affected-rows=, and =pgsql-result-notices=.
-- Column and type metadata: =pgsql-column-name=, =pgsql-column-type-oid=, =pgsql-column-type-name=, and =pgsql-type-name=.
-- Values and SQL quoting: =pgsql-null= and =pgsql-null-p= distinguish SQL NULL; =pgsql-array-literal= encodes typed arrays; =pgsql-escape-identifier= and =pgsql-escape-literal= quote SQL identifiers and string literals.
-- Diagnostics and asynchronous server messages: =pgsql-error= is the root condition for =pgsql-connection-error=, =pgsql-timeout=, =pgsql-protocol-error=, =pgsql-authentication-error=, and =pgsql-server-error=. =pgsql-error-fields= returns structured server fields, and functions in =pgsql-notice-functions= and =pgsql-notification-functions= receive a connection plus the corresponding structured plist.
+- Connection lifecycle: =pgsql-connect= (=:database=, =:user=, =:password=, =:host=, =:port=, =:sslmode=, =:connect-timeout=, =:read-timeout=, =:application-name=), =pgsql-disconnect=, =pgsql-connection-p=
+- Defaults and bounds: =pgsql-connect-timeout=, =pgsql-read-timeout=, =pgsql-sslmode=, =pgsql-application-name=, =pgsql-max-message-bytes=, =pgsql-set-connect-timeout=, =pgsql-set-read-timeout=
+- Connection state: =pgsql-live-p=, =pgsql-busy-p=, =pgsql-transaction-status=, =pgsql-parameter=, =pgsql-user=, =pgsql-host=, =pgsql-port=, =pgsql-database=
+- Execution and cancellation: =pgsql-exec=, =pgsql-exec-params=, =pgsql-exec-async=, =pgsql-exec-params-async=, =pgsql-exec-rows-async=, =pgsql-copy-out-async=, =pgsql-cancel=
+- Results and columns: =pgsql-result-p=, =pgsql-result-columns=, =pgsql-result-rows=, =pgsql-result-command-tag=, =pgsql-result-affected-rows=, =pgsql-result-notices=, =pgsql-column-name=, =pgsql-column-type-oid=, =pgsql-column-type-name=, =pgsql-type-name=
+- Values and quoting: =pgsql-null=, =pgsql-null-p=, =pgsql-array-literal=, =pgsql-escape-identifier=, =pgsql-escape-literal=
+- Errors and hooks: =pgsql-error= (subtypes: =pgsql-connection-error=, =pgsql-timeout=, =pgsql-protocol-error=, =pgsql-authentication-error=, =pgsql-server-error=), =pgsql-error-fields=, =pgsql-notice-functions=, =pgsql-notification-functions=
 
 * Development
 
-Run the complete non-live gate with:
+Run the full non-live test and lint suite (no PostgreSQL server needed):
 
 #+begin_src sh
 ./test/run-ci.sh all
 #+end_src
 
-Run the PostgreSQL 16 live suite with a test server and credentials:
+Run the live PostgreSQL 16 suite (creates and drops one temporary login role to test non-ASCII SCRAM auth, so the configured user needs =CREATEROLE=):
 
 #+begin_src sh
 PGSQL_TEST_HOST=127.0.0.1 \
@@ -145,9 +143,7 @@ PGSQL_TEST_DATABASE=pgsql_test \
 ./test/run-ci.sh live
 #+end_src
 
-The live suite uses the named test database and creates then drops one uniquely named login role to verify non-ASCII SCRAM authentication, so its configured user needs =CREATEROLE=. It never drops or alters a pre-existing role. Unit tests do not require a running PostgreSQL server.
-
-Run the self-contained TLS suite when changing SSL negotiation or certificate verification. It starts one temporary PostgreSQL 16 container with an ephemeral CA and removes all generated state on exit:
+Run the self-contained TLS test suite (spins up a temporary PostgreSQL 16 container with an ephemeral CA and cleans up on exit):
 
 #+begin_src sh
 ./test/run-tls-live-tests.sh
@@ -155,4 +151,4 @@ Run the self-contained TLS suite when changing SSL negotiation or certificate ve
 
 * License
 
-pgsql.el is released under the GNU General Public License, version 3 or later.
+GPL-3.0-or-later.
