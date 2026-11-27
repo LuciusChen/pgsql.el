@@ -1257,8 +1257,9 @@ Return zero for nil or non-built-in TYPE so PostgreSQL may infer it."
               (list "Data follows PostgreSQL RowDescription")))
     (nreverse columns)))
 
-(defun pgsql--parse-row (payload columns)
-  "Parse a DataRow PAYLOAD according to COLUMNS."
+(defun pgsql--parse-row (payload columns &optional discard)
+  "Parse a DataRow PAYLOAD according to COLUMNS.
+With DISCARD, validate the field lengths without decoding their values."
   (when (< (length payload) 2)
     (signal 'pgsql-protocol-error (list "Invalid PostgreSQL DataRow")))
   (let ((count (pgsql--read-uint16 payload 0))
@@ -1274,7 +1275,7 @@ Return zero for nil or non-built-in TYPE so PostgreSQL may infer it."
       (let ((length (pgsql--read-int32 payload offset)))
         (cl-incf offset 4)
         (cond
-         ((= length -1) (push pgsql-null values))
+         ((= length -1) (unless discard (push pgsql-null values)))
          ((< length -1)
           (signal 'pgsql-protocol-error
                   (list "Invalid PostgreSQL DataRow value length")))
@@ -1282,10 +1283,11 @@ Return zero for nil or non-built-in TYPE so PostgreSQL may infer it."
           (signal 'pgsql-protocol-error
                   (list "Truncated PostgreSQL DataRow value")))
          (t
-          (push (pgsql--decode-value
-                 (substring payload offset (+ offset length))
-                 (pgsql-column-type-oid column))
-                values)
+          (unless discard
+            (push (pgsql--decode-value
+                   (substring payload offset (+ offset length))
+                   (pgsql-column-type-oid column))
+                  values))
           (cl-incf offset length)))))
     (unless (= offset (length payload))
       (signal 'pgsql-protocol-error
@@ -1328,7 +1330,7 @@ ReadyForQuery ends RESPONSE, and nil before then."
            (unless columns
              (signal 'pgsql-protocol-error
                      (list "PostgreSQL sent DataRow before RowDescription")))
-           (let ((row (pgsql--parse-row payload columns)))
+           (let ((row (pgsql--parse-row payload columns (pgsql--response-stream-error response))))
              (if (eq (pgsql--response-stream-kind response) 'rows)
                  (pgsql--queue-stream-row connection response row)
                (push row (pgsql--response-rows response))))))
